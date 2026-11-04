@@ -1,22 +1,23 @@
-; Pacific Drive Coop: сеть (docs/WORKFLOW.md)
-; role = host (водитель) | client (пассажир) | off
+; Pacific Drive Coop: network
+; role = host (driver) | client (passenger) | off
 role=host
-; IP хоста: 127.0.0.1 для теста на одном ПК, адрес Radmin (26.x.x.x) для двух ПК
-host_ip=127.0.0.1
+; IP host: address Radmin (26.x.x.x)
+host_ip=26.x.x.x
 port=47777
-; Заднее левое сиденье относительно места водителя, см: x вперёд (минус = назад), y вправо, z вверх
+; Rear left seat relative to the driver's seat, cm: x forward (minus = back), y right, z up
 seat_x=-95
 seat_y=0
 seat_z=40
-; Заднее правое сиденье: то же, но от точки водителя, отражённой через ось машины (y меняет знак)
+; Rear right seat: the same, but from the driver's point reflected through the car's axis (y changes sign)
 seat_right_x=-95
 seat_right_y=0
 seat_right_z=40
-; Пока Client сидит, нажимать можно только двери и экран Гобблера (0 — отключить)
+; While the Client is sitting, you can only press the doors and Gobbler's screen (0 - turn off)
 restrict_interactions=1
-; Надпись "Co-op: ..." поверх игры (0 — выключить; если рядом оверлеи вроде RTSS/Afterburner и игра падает)
+; Inscription "Co-op: ..." on top of the game (0 - turn off)
+; If there are overlays like RTSS/Afterburner nearby and the game crashes
 status_overlay=1
-; Детали машины: 1 — пассажир ставит/снимает их, Host принимает; 0 — запрет (у пассажира правка откатывается)
+; Car parts: 1 - The passenger sets/removes them, the Host accepts; 0 - prohibited (the passenger's edit is rolled back)
 client_parts=1
-; Высадка (Ctrl+E): на сколько см от оси машины в сторону, с которой сидели (0 — штатная точка игры, ставит на крышу)
-exit_side_cm=230
+; landing (ctrl+e): how many centimeters from the car's axis to the side you were sitting on (0 is the game's default position, placed on the roof)
+exit_side_cm=23
