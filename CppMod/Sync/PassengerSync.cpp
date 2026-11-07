@@ -7,10 +7,14 @@
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 #include "Sync/CarSync.h"
+#include "Sync/DoorSync.h"
+#include "Sync/Notify.h"
 #include "Sync/Presence.h"
 
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <set>
 
 using namespace RC;
@@ -85,6 +89,53 @@ namespace PassengerSync
         }
 
         float dot(const Vec& a, const Vec& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; }
+
+        // Место храним на диске: после перезапуска игры Client сам вернётся на то же место (папка coop/ создаётся модом)
+        const std::filesystem::path SeatFile = L"ue4ss/Mods/PacificDriveCoop/coop/last_seat.txt";
+
+        void save_seat(int seat)
+        {
+            std::ofstream f(SeatFile, std::ios::trunc);
+            if (f) f << seat;
+        }
+
+        void clear_saved_seat()
+        {
+            std::error_code ec;
+            std::filesystem::remove(SeatFile, ec);
+        }
+
+        int load_saved_seat()
+        {
+            std::ifstream f(SeatFile);
+            int seat = -1;
+            if (f && (f >> seat) && seat >= 0 && seat <= 1) return seat;
+            return -1;
+        }
+
+        // Затемнение камеры «из чёрного» при посадке/высадке: у игры вход — тоже камера + затемнение (EnterCarDipToBlack), скелетной анимации нет
+        void camera_fade_in(UObject* character, float seconds)
+        {
+            auto** controller = property<UObject*>(character, STR("Controller"));
+            if (!controller || !*controller) return;
+            auto** cam = property<UObject*>(*controller, STR("PlayerCameraManager"));
+            if (!cam || !*cam) return;
+            struct Color
+            {
+                float R, G, B, A;
+            };
+            UFunctionCall fade(*cam, STR("StartCameraFade"));
+            auto* from = fade ? fade.param<float>(STR("FromAlpha")) : nullptr;
+            auto* to = fade ? fade.param<float>(STR("ToAlpha")) : nullptr;
+            auto* dur = fade ? fade.param<float>(STR("Duration")) : nullptr;
+            auto* color = fade ? fade.param<Color>(STR("Color")) : nullptr;
+            if (!from || !to || !dur || !color) return;
+            *from = 1.0f;
+            *to = 0.0f;
+            *dur = seconds;
+            *color = {0, 0, 0, 1};
+            fade.call();
+        }
 
         UObject* own_character() { return UObjectGlobals::FindFirstOf(STR("BaseCharacter")); }
 
@@ -178,7 +229,15 @@ namespace PassengerSync
             UObject* owner = highlight->GetOuterPrivate();
             if (!owner) return true; // не знаем, чей — не мешаем
             auto owner_class = owner->GetClassPrivate()->GetName();
-            if (owner_class == STR("BP_CarPart_Interactive_C") || owner_class == STR("BP_Carpart_Internal_GobblerScreen_C")) return true;
+            if (owner_class == STR("BP_Carpart_Internal_GobblerScreen_C")) return true;
+            // BP_CarPart_Interactive_C — точка снятия/установки детали у КАЖДОГО слота машины (тест 2026-11-06: десятки разрешённых),
+            // а не только двери. Двери — слоты Car.Equip.Body.DoorsFL/DoorsFR
+            if (owner_class == STR("BP_CarPart_Interactive_C"))
+            {
+                auto** slot = property<UObject*>(owner, STR("SlotSceneComponent"));
+                auto* tag = slot && *slot ? property<FName>(*slot, STR("SlotName")) : nullptr;
+                return tag && tag->ToString().starts_with(STR("Car.Equip.Body.Doors"));
+            }
             if (owner_class == STR("BP_PlayerCarNew_C"))
             {
                 auto name = highlight->GetName();
@@ -225,7 +284,9 @@ namespace PassengerSync
                         if (!pass) *allow = false;
                         // Подсветка перебирается каждый кадр — в лог каждая пара «класс / компонент» один раз за запуск игры
                         auto* owner = highlight->GetOuterPrivate();
-                        auto what = (owner ? owner->GetClassPrivate()->GetName() : StringType(STR("?"))) + STR(" / ") + highlight->GetName();
+                        // имя самого владельца — чтобы отличить дверь от других BP_CarPart_Interactive_C (пункт «лишние подсветки»)
+                        auto what = (owner ? owner->GetClassPrivate()->GetName() + STR(" ") + owner->GetName() : StringType(STR("?"))) + STR(" / ") +
+                                    highlight->GetName();
                         if (g_blocked_logged_names.insert((pass ? STR("+") : STR("-")) + what).second)
                             Output::send<LogLevel::Verbose>(STR("[Passenger] подсветка {} пассажиру: {}\n"), pass ? STR("разрешена") : STR("запрещена"), what);
                     },
@@ -266,6 +327,34 @@ namespace PassengerSync
         }
 
         // Слот заднего ряда пуст = место свободно (спека 3.3.3, проверено в игре: снятие батареи 1→0)
+        // Пассажир заходит через заднюю дверь своей стороны: она должна быть открыта или снята (слот двери пуст)
+        bool rear_door_passable(UObject* car, int seat)
+        {
+            auto** slot = property<UObject*>(car, seat == 1 ? STR("SLOT_RearRightDoor") : STR("SLOT_RearLeftDoor"));
+            if (!slot || !*slot) return true; // слота нет в этой машине — не мешаем
+            auto** item_slot = property<UObject*>(*slot, STR("ItemSlot"));
+            auto* items = item_slot && *item_slot ? property<RawArray>(*item_slot, STR("Items")) : nullptr;
+            if (!items || items->Num == 0) return true; // дверь снята
+            // Состояние дверей, которое Host отдаёт Client-у (DoorStates менеджера машины): 2 — заднее левое, 3 — заднее правое
+            // (лог 2026-11-06 23:10). Флаг DoorOpen актёра двери отстаёт на 8+ с — по нему открытую дверь считали закрытой
+            if (int mask = DoorSync::known_mask(); mask >= 0 && (mask & (1 << (seat == 1 ? 3 : 2)))) return true;
+            UFunctionCall where(*slot, STR("K2_GetComponentLocation"));
+            auto* at = where ? where.param<Vec>(STR("ReturnValue")) : nullptr;
+            if (!at) return true;
+            where.call();
+            // Актёр двери стоит в точке слота (замер 2026-11-06: шарнир = SLOT_RearLeft/RightDoor)
+            std::vector<UObject*> doors;
+            UObjectGlobals::FindAllOf(STR("BP_CarPart_Door_Base_C"), doors);
+            for (UObject* door : doors)
+            {
+                Vec d = actor_location(door);
+                if (std::fabs(d.X - at->X) + std::fabs(d.Y - at->Y) + std::fabs(d.Z - at->Z) > 60) continue;
+                auto* open = property<bool>(door, STR("DoorOpen"));
+                return !open || *open;
+            }
+            return true; // актёр не найден — не блокируем
+        }
+
         bool seat_free(UObject* car, int seat)
         {
             auto** slot = property<UObject*>(car, SeatSlot[seat]);
@@ -313,6 +402,62 @@ namespace PassengerSync
             place(character, at, car.Yaw);
         }
 
+        // Посадка/высадка без телепорта: путь от места игрока к порогу двери своей стороны и к сиденью (RECON 6.38). Игра ведёт
+        // игрока по таймлайну 2 с от точки двери; её точки у задних дверей все совпадают с шарниром, поэтому путь строим сами.
+        // Левое место — левая задняя дверь (y<0), правое — правая (y>0). Камера = капсула игрока, едет вместе с ней
+        struct Anim
+        {
+            bool active = false, enter = true;
+            uint64_t t0 = 0;
+            Vec start{}, door{}, finish{}; // enter: все в осях машины; exit: start и door в осях машины, finish — мир
+        } g_anim;
+        constexpr uint64_t AnimMs = 900;
+        constexpr float DoorSideCm = 95;     // шарниры задних дверей (замер 2026-11-06: y = −95 / +94)
+        constexpr float AnimMaxStartCm = 450; // дальше — не ходим, как раньше: телепорт с затемнением
+        constexpr float DoorLegShare = 0.55f; // доля времени на путь до порога
+
+        Vec lerp(const Vec& a, const Vec& b, float t) { return {a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t, a.Z + (b.Z - a.Z) * t}; }
+
+        Vec car_local(const Coop::CarStateBody& car, const Vec& world)
+        {
+            Axes a = axes(car.Pitch, car.Yaw, car.Roll);
+            Vec d{world.X - car.X, world.Y - car.Y, world.Z - car.Z};
+            return {dot(d, a.X), dot(d, a.Y), dot(d, a.Z)};
+        }
+
+        Vec car_world(const Coop::CarStateBody& car, const Vec& l)
+        {
+            Axes a = axes(car.Pitch, car.Yaw, car.Roll);
+            return {car.X + a.X.X * l.X + a.Y.X * l.Y + a.Z.X * l.Z, car.Y + a.X.Y * l.X + a.Y.Y * l.Y + a.Z.Y * l.Z,
+                    car.Z + a.X.Z * l.X + a.Y.Z * l.Y + a.Z.Z * l.Z};
+        }
+
+        // Порог двери той стороны, где сидим: тот же x, что у сиденья, снаружи кузова
+        Vec door_threshold(int seat, const Vec& seat_local) { return {seat_local.X, (seat == 1 ? 1.0f : -1.0f) * DoorSideCm, seat_local.Z}; }
+
+        // Один шаг анимации; false — анимации нет или она закончилась
+        void step_anim(UObject* character)
+        {
+            Coop::CarStateBody pose;
+            if (!g_anim.active || !CarSync::puppet_pose(pose))
+            {
+                if (g_anim.active) g_anim.active = false, set_walking(character, !g_anim.enter);
+                return;
+            }
+            float t = (std::min)(1.0f, static_cast<float>(now_ms() - g_anim.t0) / AnimMs);
+            float e = t * t * (3 - 2 * t); // плавный разгон и остановка
+            Vec at;
+            if (e < DoorLegShare) at = car_world(pose, lerp(g_anim.start, g_anim.door, e / DoorLegShare));
+            else if (g_anim.enter) at = car_world(pose, lerp(g_anim.door, g_anim.finish, (e - DoorLegShare) / (1 - DoorLegShare)));
+            else at = lerp(car_world(pose, g_anim.door), g_anim.finish, (e - DoorLegShare) / (1 - DoorLegShare));
+            place(character, at, pose.Yaw);
+            if (t >= 1.0f)
+            {
+                g_anim.active = false;
+                if (!g_anim.enter) set_walking(character, true); // дошли до земли — снова ходим
+            }
+        }
+
         void sit(int seat)
         {
             UObject* car = CarSync::puppet_car();
@@ -336,12 +481,22 @@ namespace PassengerSync
             const Vec& offset = seat == 1 ? g_seat_offset_right : g_seat_offset;
             g_seat_local = {driver.X + offset.X, (seat == 1 ? -driver.Y : driver.Y) + offset.Y, driver.Z + offset.Z};
 
+            Vec start = car_local(pose, actor_location(character));
+            Vec gap{start.X - g_seat_local.X, start.Y - g_seat_local.Y, start.Z - g_seat_local.Z};
+            if (std::sqrt(dot(gap, gap)) <= AnimMaxStartCm) g_anim = {true, true, now_ms(), start, door_threshold(seat, g_seat_local), g_seat_local};
+            else
+            {
+                g_anim.active = false;
+                camera_fade_in(character, 0.6f); // далеко от машины: как раньше, телепорт из чёрного
+            }
             set_walking(character, false);
             g_seat = seat;
+            save_seat(seat);
             Presence::set_seated(true);
             car_audio_inside(CarSync::puppet_car(), true);
             install_highlight_filter();
-            follow_car(character);
+            if (g_anim.active) step_anim(character);
+            else follow_car(character);
             Output::send<LogLevel::Verbose>(STR("[Passenger] сел на задний {}: водитель в осях машины ({:.0f}, {:.0f}, {:.0f}), место ({:.0f}, {:.0f}, {:.0f})\n"),
                                             seat == 0 ? STR("левый") : STR("правый"), driver.X, driver.Y, driver.Z, g_seat_local.X, g_seat_local.Y, g_seat_local.Z);
         }
@@ -380,9 +535,20 @@ namespace PassengerSync
                         if (!*p_failed) exit = {p_tf->Translation[0], p_tf->Translation[1], p_tf->Translation[2]};
                     }
                 }
-                place(character, exit, pose.Yaw);
-                set_walking(character, true);
+                // Выходим через порог своей стороны на точку выхода; ходьба включится, когда дойдём (step_anim)
+                if (have_pose && g_seat >= 0 && g_exit_side_cm > 0)
+                {
+                    g_anim = {true, false, now_ms(), g_seat_local, door_threshold(g_seat, g_seat_local), exit};
+                    place(character, car_world(pose, g_seat_local), pose.Yaw);
+                }
+                else
+                {
+                    camera_fade_in(character, 0.5f);
+                    place(character, exit, pose.Yaw);
+                    set_walking(character, true);
+                }
             }
+            if (g_resume_seat < 0) clear_saved_seat(); // вышли сами — не возвращать после перезапуска; унесло зоной/связью — оставить
             g_seat = -1;
             Presence::set_seated(false);
             car_audio_inside(CarSync::puppet_car(), false);
@@ -422,13 +588,7 @@ namespace PassengerSync
                 return;
             }
             // У Client своя копия машины из сейва Host — те же модули; не просим заведомо занятое (решает всё равно Host)
-            bool left_free = seat_free(car, 0), right_free = seat_free(car, 1);
-            if (!left_free && !right_free)
-            {
-                Output::send<LogLevel::Verbose>(STR("[Passenger] оба задних места заняты модулями — освободите слот (спека 3.3.3)\n"));
-                return;
-            }
-            // Сторона — та, с которой стоит пассажир (y в осях машины: минус — слева); занята она — берём другую
+            // Сторона — та, с которой стоит пассажир (y в осях машины: минус — слева); на другую не пересаживаем
             Coop::CarStateBody pose{};
             int preferred = 0;
             if (CarSync::puppet_pose(pose))
@@ -436,7 +596,13 @@ namespace PassengerSync
                 Axes ax = axes(pose.Pitch, pose.Yaw, pose.Roll);
                 preferred = dot({b.X - pose.X, b.Y - pose.Y, b.Z - pose.Z}, ax.Y) < 0 ? 0 : 1;
             }
-            int seat = (preferred == 0 ? left_free : right_free) ? preferred : 1 - preferred;
+            int seat = preferred;
+            if (!seat_free(car, seat))
+            {
+                Output::send<LogLevel::Verbose>(STR("[Passenger] на этом сиденье стоит модуль — освободите слот (спека 3.3.3)\n"));
+                Notify::push(Notify::Kind::Warn, "A car part is on that seat");
+                return;
+            }
             Net::send_seat(Coop::RequestSeat, {static_cast<uint8_t>(seat), 0});
             Output::send<LogLevel::Verbose>(STR("[Passenger] прошу место сзади: {} (подошёл с {} стороны)\n"), seat == 0 ? STR("левое") : STR("правое"),
                                             preferred == 0 ? STR("левой") : STR("правой"));
@@ -456,15 +622,12 @@ namespace PassengerSync
             Coop::SeatBody reply{request.Seat, Coop::SeatNoCar};
             if (car)
             {
-                reply.Result = Coop::SeatBlockedByModule;
-                // Запрошенное место — пожелание (Client выбирает сторону по тому, откуда подошёл); занято — другое. SeatAny — слева направо
-                int order[2] = {request.Seat == 1 ? 1 : 0, request.Seat == 1 ? 0 : 1};
-                for (int seat : order)
-                {
-                    if (!seat_free(car, seat)) continue;
-                    reply = {static_cast<uint8_t>(seat), Coop::SeatOk};
-                    break;
-                }
+                // Только та сторона, с которой подошёл пассажир (решение пользователя 2026-11-06): модуль на сиденье — отказ;
+                // дверь снята — можно, открывать не нужно; дверь есть — должна быть открыта
+                int seat = request.Seat == 1 ? 1 : 0;
+                reply = {static_cast<uint8_t>(seat), Coop::SeatOk};
+                if (!seat_free(car, seat)) reply.Result = Coop::SeatBlockedByModule;
+                else if (!rear_door_passable(car, seat)) reply.Result = Coop::SeatDoorClosed;
             }
             if (car && reply.Result == Coop::SeatBlockedByModule)
             {
@@ -480,7 +643,7 @@ namespace PassengerSync
             }
             Net::send_seat(Coop::PassengerAttach, reply);
             if (reply.Result == Coop::SeatOk) g_host_passenger = reply.Seat;
-            Output::send<LogLevel::Verbose>(STR("[Passenger] запрос посадки → {}\n"), reply.Result == Coop::SeatOk ? STR("разрешено") : reply.Result == Coop::SeatNoCar ? STR("нет машины") : STR("оба места заняты модулями"));
+            Output::send<LogLevel::Verbose>(STR("[Passenger] запрос посадки → {}\n"), reply.Result == Coop::SeatOk ? STR("разрешено") : reply.Result == Coop::SeatNoCar ? STR("нет машины") : reply.Result == Coop::SeatDoorClosed ? STR("задняя дверь закрыта") : STR("оба места заняты модулями"));
         }
     } // namespace
 
@@ -504,7 +667,11 @@ namespace PassengerSync
         if (id == Coop::PassengerAttach)
         {
             if (body.Result == Coop::SeatOk) sit(body.Seat);
-            else Output::send<LogLevel::Verbose>(STR("[Passenger] Host отказал: {}\n"), body.Result == Coop::SeatNoCar ? STR("у него нет машины") : STR("задние места заняты модулями — освободите слот"));
+            else
+            {
+                Output::send<LogLevel::Verbose>(STR("[Passenger] Host отказал: {}\n"), body.Result == Coop::SeatNoCar ? STR("у него нет машины") : body.Result == Coop::SeatDoorClosed ? STR("задняя дверь закрыта") : STR("задние места заняты модулями — освободите слот"));
+                Notify::push(Notify::Kind::Warn, body.Result == Coop::SeatDoorClosed ? "Open the door first" : body.Result == Coop::SeatNoCar ? "The driver has no car right now" : "The rear seats are taken by car parts");
+            }
         }
         else if (id == Coop::PassengerDetach && g_seat >= 0)
         {
@@ -514,9 +681,51 @@ namespace PassengerSync
 
     void on_map_loaded()
     {
+        if (g_seat >= 0) g_resume_seat = g_seat; // загрузка присланной зоны сбрасывает посадку: вернёмся на то же место, когда машина Host появится
         g_seat = g_host_passenger = -1;
+        g_anim.active = false;
         Presence::set_seated(false);
     }
+
+    namespace
+    {
+        // Камера пассажира поворачивается вместе с машиной: каждый кадр к рысканию взгляда добавляем, на сколько повернулась машина.
+        // Наклон и крен взгляда не трогаем — горизонт остаётся ровным, куда смотрит игрок внутри машины, сохраняется
+        bool g_camera_follow = true;
+        float g_last_car_yaw = NAN;
+
+        struct Rotator
+        {
+            float Pitch, Yaw, Roll;
+        };
+
+        void camera_follow(UObject* character)
+        {
+            UObject* car = CarSync::puppet_car();
+            UFunctionCall get_car(car, STR("K2_GetActorRotation"));
+            auto* car_rot = get_car ? get_car.param<Rotator>(STR("ReturnValue")) : nullptr;
+            if (!g_camera_follow || !car_rot) return;
+            get_car.call();
+            float yaw = car_rot->Yaw;
+            float delta = std::isnan(g_last_car_yaw) ? 0.f : yaw - g_last_car_yaw;
+            g_last_car_yaw = yaw;
+            delta = std::remainder(delta, 360.f); // переход через ±180
+            // больше 45° за кадр — не поворот, а телепорт машины (сброс, новая зона): камеру не дёргаем
+            if (std::fabs(delta) < 0.001f || std::fabs(delta) > 45.f) return;
+            auto** controller = property<UObject*>(character, STR("Controller"));
+            if (!controller || !*controller) return;
+            UFunctionCall get_view(*controller, STR("GetControlRotation"));
+            auto* view = get_view ? get_view.param<Rotator>(STR("ReturnValue")) : nullptr;
+            UFunctionCall set_view(*controller, STR("SetControlRotation"));
+            auto* new_view = set_view ? set_view.param<Rotator>(STR("NewRotation")) : nullptr;
+            if (!view || !new_view) return;
+            get_view.call();
+            *new_view = {view->Pitch, view->Yaw + delta, view->Roll};
+            set_view.call();
+        }
+    } // namespace
+
+    void set_camera_follow(bool on) { g_camera_follow = on; }
 
     void tick(bool is_host)
     {
@@ -524,6 +733,12 @@ namespace PassengerSync
         {
             g_key_pressed = false; // водитель садится штатно
             return;
+        }
+        static bool saved_loaded = false;
+        if (!saved_loaded) // после перезапуска игры: прежнее место из файла, сядем сами, когда машина Host появится
+        {
+            saved_loaded = true;
+            g_resume_seat = load_saved_seat();
         }
         if (g_key_pressed.exchange(false) && Net::connected()) on_key();
         if (g_seat >= 0)
@@ -533,9 +748,20 @@ namespace PassengerSync
                 g_resume_seat = g_seat; // Host уехал в новую зону: как только машина появится снова — сядем на то же место сами
                 stand_up(L"связь/машина Host пропали");
             }
-            else if (UObject* character = own_character()) follow_car(character);
+            else if (UObject* character = own_character())
+            {
+                if (g_anim.active) step_anim(character);
+                else follow_car(character);
+                camera_follow(character);
+            }
             return;
         }
+        if (g_anim.active) // идёт выход через дверь: g_seat уже сброшен, но игрок ещё в пути
+        {
+            if (UObject* character = own_character()) step_anim(character);
+            else g_anim.active = false;
+        }
+        g_last_car_yaw = NAN; // встал — при следующей посадке начинаем отсчёт заново
         if (g_resume_seat >= 0 && Net::connected() && CarSync::puppet_car() && own_character() && now_ms() - g_last_resume_ms > ResumeRetryMs)
         {
             g_last_resume_ms = now_ms();

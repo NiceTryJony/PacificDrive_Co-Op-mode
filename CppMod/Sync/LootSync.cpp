@@ -202,8 +202,41 @@ namespace LootSync
                     }
                 }
             }
-            if (ground + parts + in_crates)
-                Output::send<LogLevel::Verbose>(STR("[Loot] в учёт: +{} на земле, +{} деталей машин, +{} в ящиках; всего {}\n"), ground, parts, in_crates, g_items.size());
+            // 4. Содержимое багажников машин-доноров: ItemContainer с Outer = ItemInstance актёра BP_TemplatePart_TrunkContents_C
+            //    (RECON.md 6.27; тест 2026-11-06: Client взял 5 и 8 предметов, у Host не убавилось). Якорь — сам багажник
+            int in_trunks = 0;
+            actors.clear();
+            UObjectGlobals::FindAllOf(STR("BP_TemplatePart_TrunkContents_C"), actors);
+            if (!actors.empty())
+            {
+                std::vector<UObject*> containers;
+                UObjectGlobals::FindAllOf(STR("ItemContainer"), containers);
+                for (UObject* trunk : actors)
+                {
+                    auto** owner = property<UObject*>(trunk, STR("ItemInstance"));
+                    if (!owner || !*owner) continue;
+                    for (UObject* container : containers)
+                    {
+                        if (container->GetOuterPrivate() != *owner) continue;
+                        auto* slots = property<RawArray>(container, STR("Slots"));
+                        Vec anchor{};
+                        bool anchored = false;
+                        for (int32_t s = 0; slots && slots->Data && s < slots->Num; ++s)
+                        {
+                            auto* items = slots->Data[s] ? property<RawArray>(slots->Data[s], STR("Items")) : nullptr;
+                            for (int32_t i = 0; items && items->Data && i < items->Num; ++i)
+                            {
+                                if (!items->Data[i] || g_seen.contains(items->Data[i])) continue;
+                                if (!anchored) anchor = actor_location(trunk), anchored = true;
+                                in_trunks += consider(items->Data[i], anchor);
+                            }
+                        }
+                    }
+                }
+            }
+            if (ground + parts + in_crates + in_trunks)
+                Output::send<LogLevel::Verbose>(STR("[Loot] в учёт: +{} на земле, +{} деталей машин, +{} в ящиках, +{} в багажниках доноров; всего {}\n"), ground, parts,
+                                                in_crates, in_trunks, g_items.size());
         }
 
         void poll(bool is_host)

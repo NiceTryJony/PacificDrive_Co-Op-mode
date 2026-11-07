@@ -18,11 +18,18 @@
 #include "Sync/CarSync.h"
 #include "Sync/DoorSync.h"
 #include "Sync/PassengerSaveSync.h"
+#include "Sync/Notify.h"
 #include "Sync/StatusFile.h"
 #include "Sync/SystemsSync.h"
 #include "Sync/GarageSync.h"
 #include "Sync/PartsSync.h"
 #include "Sync/TrunkSync.h"
+#include "Sync/Diag.h"
+#include "Sync/ZoneTrace.h"
+#include "Sync/QuirkSync.h"
+#include "Sync/AnchorSync.h"
+#include "Sync/RadioSync.h"
+#include "Sync/WorldItemSync.h"
 #include "Sync/LootSync.h"
 #include "Sync/PassengerSync.h"
 #include "Sync/Presence.h"
@@ -55,6 +62,13 @@ namespace ZoneSave
 {
     constexpr uint8_t SaveTypeManual = 1; // ESaveType::MANUAL
     std::atomic<bool> g_requested{false};
+    std::atomic<uint64_t> g_connect_ms{0}; // момент подключения (steady_clock, мс) — нулевая точка лога [Timeline]
+    uint64_t since_connect()
+    {
+        auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        auto t0 = g_connect_ms.load();
+        return t0 ? now - t0 : 0;
+    }
     bool g_waiting = false;
     int32_t g_slot = -1;
     Hook::GlobalCallbackId g_tick_id{};
@@ -86,6 +100,7 @@ namespace ZoneSave
         // Пишем в текущий слот игрока — ровно то же, что делает игра при выходе в меню
         *p_slot = g_slot = *slot;
         *p_type = SaveTypeManual;
+        Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: SaveGame вызывается\n"), since_connect());
         fn.call();
         g_waiting = true;
         Output::send<LogLevel::Verbose>(STR("[ZoneSave] SaveGame(slot={}) вызван, ждём конца асинхронной записи\n"), g_slot);
@@ -115,6 +130,7 @@ namespace ZoneSave
         std::filesystem::create_directories(CoopDir, ec);
         std::filesystem::copy_file(path, ZoneFile, std::filesystem::copy_options::overwrite_existing, ec);
         Output::send<LogLevel::Verbose>(STR("[ZoneSave] копия: {}{}\n"), ZoneFile.wstring(), ec ? STR(" — ОШИБКА КОПИРОВАНИЯ") : STR(""));
+        Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: сейв зоны записан, отправляю\n"), since_connect());
         if (Net::connected())
         {
             std::ifstream f(path, std::ios::binary);
@@ -274,7 +290,9 @@ namespace ZoneLoad
         // Загрузка уровня блокирует игровой поток ~10 с — надпись поднимаем до вызова (окно живёт в своём потоке)
         g_loading_since_ms = now_ms();
         if (g_net_config.status_overlay) StatusOverlay::set(L"Co-op: loading the host's world - please wait...");
+        Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: UserLoadGame вызывается\n"), ZoneSave::since_connect());
         fn.call();
+        Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: UserLoadGame вернулся\n"), ZoneSave::since_connect());
         auto* ret = fn.param<bool>(STR("ReturnValue"));
         if (ret && !*ret) g_loading_since_ms = 0; // игра отказала — карта грузиться не будет
         Output::send<LogLevel::Verbose>(STR("[ZoneLoad] UserLoadGame(slot={}) → {}\n"), slot, ret ? (*ret ? STR("true") : STR("false")) : STR("?"));
@@ -345,7 +363,11 @@ namespace AutoSave
         g_waiting_quiet = false;
         g_zone_ready = true;
         Output::send<LogLevel::Verbose>(STR("[AutoSave] карта готова{}\n"), Net::connected() ? STR(" — сохраняю и отправляю") : STR(", клиента нет — отправлю при подключении"));
-        if (Net::connected()) ZoneSave::g_requested = true;
+        if (Net::connected())
+        {
+            ZoneSave::g_requested = true;
+            Notify::push(Notify::Kind::Info, "World saved and sent to your passenger");
+        }
     }
 
     void on_client_connected()
@@ -367,7 +389,28 @@ namespace Overlay
     void on_map_loaded()
     {
         if (!g_ready_at_ms) g_ready_at_ms = ZoneLoad::now_ms() + StartDelayMs;
-        if (ZoneLoad::g_loading_since_ms.exchange(0)) g_world_synced = true;
+        if (ZoneLoad::g_loading_since_ms.exchange(0))
+        {
+            g_world_synced = true;
+            Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: карта хоста загружена\n"), ZoneSave::since_connect());
+        }
+    }
+
+    // Что сейчас происходит — для надписи в игре и для лаунчера (status.txt phase=), ASCII. Пусто у Client — всё готово
+    std::wstring phase()
+    {
+        if (g_net_config.role == Net::Role::Host)
+            return Net::connected() ? L"hosting - the passenger is connected" : L"hosting - waiting for the passenger's game";
+        if (g_net_config.role != Net::Role::Client) return L"co-op is off (no role in coop.ini)";
+        if (!g_ready_at_ms) return L"game is starting...";
+        if (!Net::connected()) g_world_synced = false;
+        uint64_t since = ZoneLoad::g_loading_since_ms;
+        if (since && ZoneLoad::now_ms() - since < LoadingTimeoutMs) return L"loading the host's world - please wait...";
+        if (int percent = Net::zone_progress(); percent >= 0) return std::format(L"receiving the world from the host - {}%", percent);
+        if (!Net::connected()) return L"waiting for the host's game...";
+        if (PassengerSaveSync::restore_pending()) return L"restoring your inventory from the host - please wait...";
+        if (!g_world_synced) return L"connected - waiting for the host's world...";
+        return {};
     }
 
     std::wstring text()
@@ -376,14 +419,8 @@ namespace Overlay
         // Второй ПК упал при запуске игры, через ~2 с после загрузки мода (dxgi, RTSS в процессе; дамп 23:51): в первые секунды
         // игра ещё создаёт окно и устройство отрисовки — наше окно topmost и сообщения её окну в это время ни к чему
         if (!g_ready_at_ms || ZoneLoad::now_ms() < g_ready_at_ms) return {};
-        if (!Net::connected()) g_world_synced = false;
-        uint64_t since = ZoneLoad::g_loading_since_ms;
-        if (since && ZoneLoad::now_ms() - since < LoadingTimeoutMs) return L"Co-op: loading the host's world - please wait...";
-        if (int percent = Net::zone_progress(); percent >= 0) return std::format(L"Co-op: receiving the world from the host - {}%", percent);
-        if (!Net::connected()) return L"Co-op: waiting for the host...";
-        if (PassengerSaveSync::restore_pending()) return L"Co-op: restoring your inventory from the host - please wait...";
-        if (!g_world_synced) return L"Co-op: connected - waiting for the host's world...";
-        return {};
+        auto p = phase();
+        return p.empty() ? p : L"Co-op: " + p;
     }
 } // namespace Overlay
 
@@ -393,7 +430,7 @@ public:
     PacificDriveCoop() : CppUserModBase()
     {
         ModName = STR("PacificDriveCoop");
-        ModVersion = STR("0.16.3");
+        ModVersion = STR("0.17.3");
         for (auto c : ModVersion) g_version += static_cast<char>(c); // версия — ASCII
         ModDescription = STR("2-player LAN coop: driver + passenger");
         ModAuthors = STR("sanokoo");
@@ -406,6 +443,7 @@ public:
         register_keydown_event(Input::Key::F8, {Input::ModifierKey::CONTROL}, [] { g_dump_item_props = true; }); // диагностика свойств предметов рюкзака
         register_keydown_event(Input::Key::F4, {Input::ModifierKey::CONTROL}, [] { g_dump_tintable = true; });
         register_keydown_event(Input::Key::F5, {Input::ModifierKey::CONTROL}, [] { g_dump_object = true; });
+        register_keydown_event(Input::Key::F6, {Input::ModifierKey::CONTROL}, [] { Diag::g_snapshot_requested = true; }); // полный срез в лог
         register_keydown_event(Input::Key::F9, {Input::ModifierKey::CONTROL}, [] { g_selftest_item_props = true; }); // самопроверка записи свойств
         Output::send<LogLevel::Verbose>(STR("[PacificDriveCoop] {} loaded, Ctrl+F10 = сохранить зону, Ctrl+F11 = загрузить зону (клиент), Ctrl+E = сесть/выйти (пассажир)\n"), ModVersion);
     }
@@ -414,6 +452,7 @@ public:
     {
         if (ZoneSave::g_tick_id) Hook::UnregisterCallback(ZoneSave::g_tick_id);
         if (m_load_map_id) Hook::UnregisterCallback(m_load_map_id);
+        ZoneTrace::uninstall();
         Net::stop();
         StatusOverlay::stop();
     }
@@ -422,6 +461,8 @@ public:
     {
         g_net_events.log = [](const std::wstring& msg) { Output::send<LogLevel::Verbose>(STR("{}\n"), msg); };
         g_net_events.on_connected = [] {
+            ZoneSave::g_connect_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+            Output::send<LogLevel::Verbose>(STR("[Timeline] +0 мс: подключено\n"));
             AutoSave::on_client_connected();
             DoorSync::on_connected(g_net_config.role == Net::Role::Host);
             SystemsSync::on_connected(g_net_config.role == Net::Role::Host);
@@ -445,16 +486,27 @@ public:
         g_net_events.on_car_state = CarSync::on_car_state;
         g_net_events.on_loot = [](Coop::PacketId id, const Coop::LootBody& body) { LootSync::on_loot(id, body, g_net_config.role == Net::Role::Host); };
         g_net_events.on_seat = [](Coop::PacketId id, const Coop::SeatBody& body) { PassengerSync::on_seat(id, body, g_net_config.role == Net::Role::Host); };
+        g_net_events.on_quirk_set = QuirkSync::on_quirk_set;
+        g_net_events.on_quirk_cure = QuirkSync::on_quirk_cure;
+        g_net_events.on_quirk_know = QuirkSync::on_quirk_know;
+        g_net_events.on_anchor = AnchorSync::on_anchor;
+        g_net_events.on_radio = RadioSync::on_radio;
+        g_net_events.on_world_item = WorldItemSync::on_world_item;
         g_net_events.on_zone_save = [](std::vector<uint8_t>&& file) {
             std::error_code ec;
             std::filesystem::create_directories(ZoneSave::CoopDir, ec);
             std::ofstream(ZoneSave::ZoneFile, std::ios::binary).write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+            Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: сейв зоны получен и записан\n"), ZoneSave::since_connect());
+            Notify::push(Notify::Kind::Info, "Got the driver's world, loading it");
             ZoneLoad::g_requested = true; // клиент сразу грузит присланную зону
         };
+        Notify::init(ZoneSave::CoopDir / "notify.txt");
+        RadioSync::init(ZoneSave::CoopDir);
         g_net_config = Net::load_config(ZoneSave::CoopDir.parent_path() / "coop.ini");
         PassengerSync::set_seat_offsets(g_net_config.seat_x, g_net_config.seat_y, g_net_config.seat_z, g_net_config.seat_right_x, g_net_config.seat_right_y,
                                         g_net_config.seat_right_z);
         PassengerSync::set_restrict_interactions(g_net_config.restrict_interactions);
+        PassengerSync::set_camera_follow(g_net_config.camera_follow);
         PassengerSync::set_exit_side_cm(g_net_config.exit_side_cm);
         PartsSync::set_client_parts(g_net_config.client_parts);
         if (g_net_config.role == Net::Role::Off)
@@ -464,18 +516,27 @@ public:
 
         ZoneSave::g_tick_id = Hook::RegisterEngineTickPreCallback(
                 [](Hook::TCallbackIterationData<void>&, UEngine*, float delta_seconds, bool) {
-                    Net::tick(g_net_events);
-                    Presence::tick(delta_seconds);
-                    CarSync::tick(delta_seconds, g_net_config.role == Net::Role::Host);
-                    PassengerSync::tick(g_net_config.role == Net::Role::Host);
-                    LootSync::tick(g_net_config.role == Net::Role::Host);
-                    DoorSync::tick(g_net_config.role == Net::Role::Host);
-                    SystemsSync::tick(g_net_config.role == Net::Role::Host);
-                    GarageSync::tick(g_net_config.role == Net::Role::Host);
-                    PartsSync::tick(g_net_config.role == Net::Role::Host);
-                    TrunkSync::tick(g_net_config.role == Net::Role::Host);
-                    PassengerSaveSync::tick(g_net_config.role == Net::Role::Host, ZoneLoad::current_slot_file);
-                    StatusFile::tick(ZoneSave::CoopDir / "status.txt", g_version, g_net_config.role);
+                    const bool host = g_net_config.role == Net::Role::Host;
+                    Diag::perf(0, [&] { Net::tick(g_net_events); });
+                    Diag::perf(1, [&] { Presence::tick(delta_seconds); });
+                    Diag::perf(2, [&] { CarSync::tick(delta_seconds, host); });
+                    Diag::perf(3, [&] { PassengerSync::tick(host); });
+                    Diag::perf(4, [&] { LootSync::tick(host); });
+                    Diag::perf(5, [&] { DoorSync::tick(host); });
+                    Diag::perf(6, [&] { SystemsSync::tick(host); });
+                    Diag::perf(7, [&] { GarageSync::tick(host); });
+                    Diag::perf(8, [&] { PartsSync::tick(host); });
+                    Diag::perf(9, [&] { TrunkSync::tick(host); });
+                    Diag::perf(10, [&] { Diag::tick(host); });
+                    Diag::perf(11, [&] { PassengerSaveSync::tick(host, ZoneLoad::current_slot_file); });
+                    Diag::perf(12, [&] { StatusFile::tick(ZoneSave::CoopDir / "status.txt", g_version, g_net_config.role, [] { std::string s; for (wchar_t c : Overlay::phase()) s += static_cast<char>(c); return s; }()); }); // phase — ASCII
+                    Diag::perf(13, [&] { QuirkSync::tick(host); });
+                    Diag::perf(14, [&] { AnchorSync::tick(host); });
+                    Diag::perf(15, [&] { ZoneTrace::tick(); });
+                    RadioSync::tick(host);
+                    WorldItemSync::tick(host);
+                    Notify::tick(Net::connected(), host, DoorSync::known_mask());
+                    Diag::perf_report();
                     if (g_dump_item_props.exchange(false)) ItemProps::dump_backpack();
                     if (g_selftest_item_props.exchange(false)) ItemProps::selftest_write();
                     if (g_dump_tintable.exchange(false)) ItemProps::dump_tintable();
@@ -499,8 +560,13 @@ public:
                     GarageSync::on_map_loaded();
                     PartsSync::on_map_loaded();
                     TrunkSync::on_map_loaded();
+                    ZoneTrace::on_map_loaded();
+                    QuirkSync::on_map_loaded();
+                    AnchorSync::on_map_loaded();
+                    WorldItemSync::on_map_loaded();
                 },
                 {false, true, STR("PacificDriveCoop"), STR("AutoSave")});
+        ZoneTrace::install(g_net_config.role == Net::Role::Host);
         Output::send<LogLevel::Verbose>(STR("[PacificDriveCoop] хуки: EngineTick {}, LoadMap {}\n"), ZoneSave::g_tick_id ? STR("есть") : STR("НЕТ"),
                                         m_load_map_id ? STR("есть") : STR("НЕТ"));
     }

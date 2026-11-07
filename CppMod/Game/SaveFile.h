@@ -27,12 +27,12 @@ namespace SaveFile
     std::optional<Container> read(const std::vector<uint8_t>& file, std::string& error);
 
     // Файл с заголовком и таблицей из Header и тем же видом каждого блока (GAME — LZ4, остальные — как есть).
-    // Как pack() в tools/sav_inventory.py — результат обязан совпасть с ним байт в байт
+    // Как pack() в tools/sav_inventory.py, но GAME сжат по-настоящему: сверять с эталоном по распакованным блокам, не по байтам
     std::vector<uint8_t> write(const Container& c);
 
     // LZ4 block (без кадра); nullopt — данные битые или размер не совпал с ожидаемым
     std::optional<std::vector<uint8_t>> lz4_decompress(const uint8_t* src, size_t size, size_t expected);
 
-    // Корректный LZ4 block из одних литералов: без поиска совпадений, чуть больше исходного (GAME ~10 МБ вместо ~3 МБ)
-    std::vector<uint8_t> lz4_literals(const std::vector<uint8_t>& src);
+    // Настоящий LZ4 block (жадный, хэш 4 байт): GAME ~7 МБ → ~2,6 МБ, как у игры. Раньше писали одни литералы — файл пассажира раздувался в 2,7 раза
+    std::vector<uint8_t> lz4_compress(const std::vector<uint8_t>& src);
 } // namespace SaveFile

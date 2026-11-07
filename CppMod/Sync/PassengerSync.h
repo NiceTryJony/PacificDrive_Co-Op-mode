@@ -11,6 +11,7 @@ namespace PassengerSync
     void on_map_loaded();
     void set_exit_side_cm(float cm); // из coop.ini (exit_side_cm): высадка сбоку на столько см от оси машины; 0 — штатная точка игры
     void set_restrict_interactions(bool on); // из coop.ini (restrict_interactions): пассажиру доступны только двери и карта
+    void set_camera_follow(bool on);         // из coop.ini (camera_follow): камера сидящего пассажира поворачивается с машиной
     // из coop.ini: левое место — seat_x/y/z, правое — seat_right_x/y/z (см от точки водителя; у правого — отражённой через ось машины)
     void set_seat_offsets(float left_x, float left_y, float left_z, float right_x, float right_y, float right_z);
     void tick(bool is_host); // игровой поток

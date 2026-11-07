@@ -185,6 +185,29 @@ namespace Net
             case Coop::InventoryAction:
                 if (auto* loot = Coop::body_of<Coop::LootBody>(data, size); loot && events.on_loot) events.on_loot(static_cast<Coop::PacketId>(data[0]), *loot);
                 break;
+            case Coop::QuirkSet:
+                if (auto* b = Coop::body_of<Coop::QuirkSetBody>(data, size); b && events.on_quirk_set) events.on_quirk_set(*b);
+                break;
+            case Coop::QuirkCure:
+                if (auto* b = Coop::body_of<Coop::QuirkBody>(data, size); b && events.on_quirk_cure) events.on_quirk_cure(*b);
+                break;
+            case Coop::QuirkKnow:
+                if (auto* b = Coop::body_of<Coop::QuirkKnowBody>(data, size); b && events.on_quirk_know) events.on_quirk_know(*b);
+                break;
+            case Coop::WorldItem:
+                if (Coop::WorldItemBody body; events.on_world_item)
+                {
+                    std::string path;
+                    std::vector<Coop::TrunkValue> values;
+                    if (Coop::parse_world_item(data, size, body, path, values)) events.on_world_item(body, path, values);
+                }
+                break;
+            case Coop::RadioTrack:
+                if (std::string kind, name; events.on_radio && Coop::parse_part(data, size, kind, name)) events.on_radio(kind, name);
+                break;
+            case Coop::AnchorTaken:
+                if (auto* b = Coop::body_of<Coop::AnchorBody>(data, size); b && events.on_anchor) events.on_anchor(*b);
+                break;
             case Coop::HostPose:
             case Coop::PassengerPose:
                 if (auto* pose = Coop::body_of<Coop::PoseBody>(data, size); pose && events.on_pose) events.on_pose(*pose);
@@ -223,6 +246,7 @@ namespace Net
             else if (key == "seat_right_y") config.seat_right_y = static_cast<float>(std::atof(value.c_str()));
             else if (key == "seat_right_z") config.seat_right_z = static_cast<float>(std::atof(value.c_str()));
             else if (key == "restrict_interactions") config.restrict_interactions = value != "0";
+            else if (key == "camera_follow") config.camera_follow = value != "0";
             else if (key == "exit_side_cm") config.exit_side_cm = static_cast<float>(std::atof(value.c_str()));
             else if (key == "status_overlay") config.status_overlay = value != "0";
             else if (key == "client_parts") config.client_parts = value != "0";
@@ -360,6 +384,20 @@ namespace Net
     {
         send(Coop::ChannelReliable, Coop::make_packet(id, ++g_sequence, body));
     }
+
+    void send_quirk_set(const Coop::QuirkSetBody& body) { send(Coop::ChannelReliable, Coop::make_packet(Coop::QuirkSet, ++g_sequence, body)); }
+    void send_quirk_cure(const Coop::QuirkBody& body) { send(Coop::ChannelReliable, Coop::make_packet(Coop::QuirkCure, ++g_sequence, body)); }
+    void send_quirk_know(const Coop::QuirkKnowBody& body) { send(Coop::ChannelReliable, Coop::make_packet(Coop::QuirkKnow, ++g_sequence, body)); }
+    bool send_world_item(const Coop::WorldItemBody& body, const std::string& path, const std::vector<Coop::TrunkValue>& values)
+    {
+        auto packet = Coop::make_world_item_packet(g_sequence + 1, body, path, values);
+        if (packet.empty()) return false;
+        ++g_sequence;
+        send(Coop::ChannelReliable, packet);
+        return true;
+    }
+
+    void send_anchor(const Coop::AnchorBody& body) { send(Coop::ChannelReliable, Coop::make_packet(Coop::AnchorTaken, ++g_sequence, body)); }
 
     void send_systems(const Coop::SystemsBody& body)
     {

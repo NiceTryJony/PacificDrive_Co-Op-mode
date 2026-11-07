@@ -29,6 +29,7 @@ namespace Net
         float seat_right_x = -95, seat_right_y = 0, seat_right_z = 40;
         // Пока пассажир сидит, подсвечиваются (нажимаются) только двери и карта; 0 — отключить, если что-то нужное оказалось недоступным
         bool restrict_interactions = true;
+        bool camera_follow = true; // камера сидящего пассажира поворачивается вместе с машиной
         // Высадка (Ctrl+E): на сколько см в сторону от оси машины (с той стороны, где сидели); 0 — штатная точка игры (ставила на крышу)
         float exit_side_cm = 230;
         // Надпись «Co-op: …» поверх игры (отдельное окно Windows); 0 — выключить, если рядом оверлеи (RTSS, Afterburner…) и игра падает
@@ -56,6 +57,12 @@ namespace Net
         // багажник: TrunkItem/TrunkDenied (Client), TrunkTake/TrunkPut (Host) — сколько предметов архетипа
         std::function<void(Coop::PacketId, uint16_t, const std::string&, const std::vector<Coop::TrunkValue>&)> on_trunk;
         std::function<void(Coop::PacketId, const Coop::LootBody&)> on_loot; // подбор лута: LootPicked/LootDenied (Client), InventoryAction (Host)
+        std::function<void(const Coop::QuirkSetBody&)> on_quirk_set;  // Client: причуды машины Host
+        std::function<void(const Coop::QuirkBody&)> on_quirk_cure;    // Host: пассажир вылечил причуду
+        std::function<void(const Coop::QuirkKnowBody&)> on_quirk_know; // Host: пассажир выяснил о причуде
+        std::function<void(const Coop::WorldItemBody&, const std::string&, const std::vector<Coop::TrunkValue>&)> on_world_item; // собеседник положил предмет на землю
+        std::function<void(const std::string&, const std::string&)> on_radio; // Client: текущий трек радио Host (вид, имя)
+        std::function<void(const Coop::AnchorBody&)> on_anchor;       // якорь в этой точке взял собеседник
     };
 
     // coop.ini: строки key=value — role=host|client|off, host_ip=..., port=..., seat_x/seat_y/seat_z=...
@@ -80,6 +87,11 @@ namespace Net
     void send_loot(Coop::PacketId id, const Coop::LootBody& body); // reliable
     void send_door(Coop::PacketId id, const Coop::DoorBody& body); // reliable: DoorState (Host) / DoorRequest (Client)
     void send_systems(const Coop::SystemsBody& body);               // reliable, Host
+    void send_quirk_set(const Coop::QuirkSetBody& body);            // reliable, Host
+    void send_quirk_cure(const Coop::QuirkBody& body);              // reliable, Client
+    void send_quirk_know(const Coop::QuirkKnowBody& body);          // reliable, Client
+    bool send_world_item(const Coop::WorldItemBody& body, const std::string& path, const std::vector<Coop::TrunkValue>& values); // reliable, оба
+    void send_anchor(const Coop::AnchorBody& body);                 // reliable, оба
     void send_garage_door(Coop::PacketId id, const Coop::GarageDoorBody& body); // reliable: GarageDoor (Host) / GarageDoorRequest (Client)
     // reliable; CarPart — Host → Client, CarPartRequest — Client → Host; false — не влезло в пакет
     bool send_part(const std::string& tag, const std::string& path, Coop::PacketId id = Coop::CarPart);

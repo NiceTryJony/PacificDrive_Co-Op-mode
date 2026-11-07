@@ -1,23 +1,32 @@
-; Pacific Drive Coop: network
-; role = host (driver) | client (passenger) | off
+; Pacific Drive Coop: сеть (docs/WORKFLOW.md)
+; role = host (водитель) | client (пассажир) | off
 role=host
-; IP host: address Radmin (26.x.x.x)
-host_ip=26.x.x.x
+; IP хоста: 127.0.0.1 для теста на одном ПК, адрес Radmin (26.x.x.x) для двух ПК
+host_ip=127.0.0.1
 port=47777
-; Rear left seat relative to the driver's seat, cm: x forward (minus = back), y right, z up
+; Заднее левое сиденье относительно места водителя, см: x вперёд (минус = назад), y вправо, z вверх
 seat_x=-95
 seat_y=0
 seat_z=40
-; Rear right seat: the same, but from the driver's point reflected through the car's axis (y changes sign)
+; Заднее правое сиденье: то же, но от точки водителя, отражённой через ось машины (y меняет знак)
 seat_right_x=-95
 seat_right_y=0
 seat_right_z=40
-; While the Client is sitting, you can only press the doors and Gobbler's screen (0 - turn off)
+; Пока Client сидит, нажимать можно только двери и экран Гобблера (0 — отключить)
 restrict_interactions=1
-; Inscription "Co-op: ..." on top of the game (0 - turn off)
-; If there are overlays like RTSS/Afterburner nearby and the game crashes
+; Камера сидящего пассажира поворачивается вместе с машиной, горизонт ровный (0 — камера стоит на месте, как в игре)
+camera_follow=1
+; Надпись "Co-op: ..." поверх игры (0 — выключить; если рядом оверлеи вроде RTSS/Afterburner и игра падает)
 status_overlay=1
-; Car parts: 1 - The passenger sets/removes them, the Host accepts; 0 - prohibited (the passenger's edit is rolled back)
+; Детали машины: 1 — пассажир ставит/снимает их, Host принимает; 0 — запрет (у пассажира правка откатывается)
 client_parts=1
-; landing (ctrl+e): how many centimeters from the car's axis to the side you were sitting on (0 is the game's default position, placed on the roof)
-exit_side_cm=23
+; Высадка (Ctrl+E): на сколько см от оси машины в сторону, с которой сидели (0 — штатная точка игры, ставит на крышу)
+exit_side_cm=230
+; HUD (Lua, читает только при старте игры): hud=0 — выключить; hud_panel=0 — без плашки статуса
+; hud_corner: tl|tr|bl|br; hud_text — размер текста в процентах (60..200); hud_toast_sec — сколько висит уведомление; hud_fade=0 — не приглушать плашку
+hud=1
+hud_panel=1
+hud_corner=tl
+hud_text=100
+hud_toast_sec=4
+hud_fade=1

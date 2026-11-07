@@ -68,19 +68,50 @@ namespace SaveFile
         return out;
     }
 
-    std::vector<uint8_t> lz4_literals(const std::vector<uint8_t>& src)
+    std::vector<uint8_t> lz4_compress(const std::vector<uint8_t>& src)
     {
+        const size_t n = src.size();
         std::vector<uint8_t> out;
-        size_t n = src.size();
-        if (n < 15) out.push_back(static_cast<uint8_t>(n << 4));
-        else
+        out.reserve(n / 2 + 64);
+        auto put_len = [&](size_t len) {
+            for (; len >= 255; len -= 255) out.push_back(255);
+            out.push_back(static_cast<uint8_t>(len));
+        };
+        // Последовательность: литералы + (кроме последней) совпадение длиной mlen >= 4 со смещением offset
+        auto emit = [&](size_t from, size_t lit, size_t offset, size_t mlen) {
+            out.push_back(static_cast<uint8_t>((std::min<size_t>(lit, 15) << 4) | (mlen ? std::min<size_t>(mlen - 4, 15) : 0)));
+            if (lit >= 15) put_len(lit - 15);
+            out.insert(out.end(), src.begin() + from, src.begin() + from + lit);
+            if (!mlen) return;
+            out.push_back(static_cast<uint8_t>(offset));
+            out.push_back(static_cast<uint8_t>(offset >> 8));
+            if (mlen - 4 >= 15) put_len(mlen - 4 - 15);
+        };
+        std::vector<uint32_t> table(1u << 16, 0); // позиция + 1; 0 — пусто
+        size_t anchor = 0, ip = 0;
+        // Правила формата: последнее совпадение начинается не позже n-12 и кончается не ближе 5 байт к концу
+        if (n >= 13)
         {
-            out.push_back(0xF0);
-            size_t rest = n - 15;
-            for (; rest >= 255; rest -= 255) out.push_back(255);
-            out.push_back(static_cast<uint8_t>(rest));
+            while (ip <= n - 12)
+            {
+                uint32_t seq;
+                std::memcpy(&seq, &src[ip], 4);
+                uint32_t& slot = table[(seq * 2654435761u) >> 16];
+                size_t ref = slot;
+                slot = static_cast<uint32_t>(ip + 1);
+                uint32_t prev;
+                if (ref-- && ip - ref <= 65535 && (std::memcpy(&prev, &src[ref], 4), prev == seq))
+                {
+                    size_t len = 4;
+                    while (ip + len < n - 5 && src[ref + len] == src[ip + len]) ++len;
+                    emit(anchor, ip - anchor, ip - ref, len);
+                    ip += len;
+                    anchor = ip;
+                }
+                else ++ip;
+            }
         }
-        out.insert(out.end(), src.begin(), src.end());
+        emit(anchor, n - anchor, 0, 0);
         return out;
     }
 
@@ -92,7 +123,7 @@ namespace SaveFile
         std::vector<uint32_t> offsets;
         for (auto& b : c.Blocks)
         {
-            stored.push_back(b.Type == 6 ? lz4_literals(b.Data) : b.Data);
+            stored.push_back(b.Type == 6 ? lz4_compress(b.Data) : b.Data);
             offsets.push_back(static_cast<uint32_t>(out.size()));
             out.insert(out.end(), stored.back().begin(), stored.back().end());
         }

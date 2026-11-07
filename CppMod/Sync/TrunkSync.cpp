@@ -8,6 +8,7 @@
 #include "Game/ItemProps.h"
 #include "Game/Items.h"
 #include "Game/UFunctionCall.h"
+#include "Notify.h"
 #include "Networking/Net.h"
 
 #include <algorithm>
@@ -35,7 +36,7 @@ namespace TrunkSync
 {
     namespace
     {
-        constexpr uint64_t PollMs = 1000;
+        constexpr uint64_t PollMs = 400; // было 1000: пассажир ждал секунды; ItemProps::read на каждый предмет — следить, не раздувается ли сейв (DECISIONS 2026-10-30)
         constexpr uint64_t SettleMs = 5000; // после загрузки карты машина ещё собирается
         constexpr int MaxApplyAttempts = 3;
 
@@ -386,6 +387,7 @@ namespace TrunkSync
                 }
                 taken.pop_back();
             }
+            Notify::push(Notify::Kind::Warn, "The driver already took that from the trunk");
             Output::send<LogLevel::Warning>(STR("[TrunkSync] Host уже забрал {} × {} — убрано у пассажира {}\n"), describe(stack), count, removed);
         }
 
@@ -548,5 +550,28 @@ namespace TrunkSync
             else ++it; // часть не легла — повторим на следующем опросе
         }
         g_prev = read_all(); // после применения: следующий опрос сравнит с этим
+    }
+
+    // Ctrl+F6 (Diag): что лежит в багажнике, станции и гоблере — число предметов и стопок
+    void describe()
+    {
+        static const TCHAR* names[PlaceCount] = {STR("багажник"), STR("станция"), STR("гоблер")};
+        for (int place = 0; place < PlaceCount; ++place)
+        {
+            auto trunk = find_place(place);
+            if (!trunk.container)
+            {
+                Output::send<LogLevel::Verbose>(STR("[Diag] {}: контейнера нет\n"), names[place]);
+                continue;
+            }
+            int total = 0;
+            std::string list;
+            for (auto& [key, entry] : read_items(trunk.container, place))
+            {
+                total += static_cast<int>(entry.Items.size());
+                list += std::format(" {}×{}", entry.Items.size(), entry.Stack.Path.substr(entry.Stack.Path.rfind('/') + 1));
+            }
+            Output::send<LogLevel::Verbose>(STR("[Diag] {}: предметов {};{}\n"), names[place], total, Items::wide(list));
+        }
     }
 } // namespace TrunkSync

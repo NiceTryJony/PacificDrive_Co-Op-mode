@@ -7,5 +7,6 @@
 
 namespace StatusFile
 {
-    void tick(const std::filesystem::path& file, const std::string& version, Net::Role role); // игровой поток
+    // phase — что сейчас происходит (строка для лаунчера), пусто — всё готово
+    void tick(const std::filesystem::path& file, const std::string& version, Net::Role role, const std::string& phase); // игровой поток
 } // namespace StatusFile

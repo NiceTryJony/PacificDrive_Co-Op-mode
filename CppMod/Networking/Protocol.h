@@ -43,6 +43,12 @@ namespace Coop
         PassengerPose = 25, // Client→Host: поза пассажира (PoseBody) — вместо ввода, docs/DECISIONS.md
         PassengerSave = 26,        // Client→Host: сейв кооп-слота с инвентарём пассажира; Host→Client: ответ на запрос (куски, как ZoneSave)
         PassengerSaveRequest = 28, // Client→Host: пришли мой сейв (Have=1); Host→Client: у меня его нет (Have=0)
+        QuirkSet = 34,     // Host→Client: все причуды машины Host (QuirkSetBody), RECON.md 6.30
+        QuirkCure = 35,    // Client→Host: пассажир вылечил причуду (QuirkBody) — Host лечит у себя
+        AnchorTaken = 36,  // оба направления: якорь взят из основания в этой точке (AnchorBody) — снять у себя
+        WorldItem = 39,    // оба направления: игрок положил предмет на землю (WorldItemBody + путь архетипа + значения свойств)
+        RadioTrack = 38,   // Host→Client: текущий трек радио (PartBody: вид file|stock + имя файла/Title), RECON.md 6.36
+        QuirkKnow = 37,    // Client→Host: пассажир выяснил о причуде (QuirkKnowBody) — Host добавляет к своему знанию
         Ping = 40,    // Client→Host, Host отвечает тем же пакетом (эхо)
     };
 
@@ -86,6 +92,7 @@ namespace Coop
         SeatOk = 0,
         SeatBlockedByModule = 1, // в слоте заднего ряда стоит модуль (спека 3.3.3)
         SeatNoCar = 2,
+        SeatDoorClosed = 3,      // задняя дверь с этой стороны закрыта (откройте её или снимите)
     };
 
     // Двери машины: 6 штук, EOpenableDoors 0..5 (BP_CarManager_C.DoorStates, RECON.md «6.2»); бит i = дверь i открыта.
@@ -133,6 +140,36 @@ namespace Coop
         auto apart = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) >= PercentStep; };
         return sent.Ignition != now.Ignition || sent.Lights != now.Lights || sent.Radio != now.Radio || apart(sent.Fuel, now.Fuel) || apart(sent.Battery, now.Battery);
     }
+
+    // Причуда = пара классов «условие → поведение» (SE_Quirk_MixAndMatch_C.QuirkCondition/QuirkBehavior): у Host и Client одинаковые,
+    // все причуды — один класс, поэтому ключ — FNV-1a строки "QC_…|QB_…"
+    struct QuirkBody
+    {
+        uint32_t Key;
+    };
+    constexpr int MaxQuirks = 16;
+    struct QuirkSetBody
+    {
+        uint8_t Count;
+        uint32_t Keys[MaxQuirks];
+        uint8_t Known[MaxQuirks]; // что о причуде выяснено (биты QuirkKnown*), у причуд с одним ключом — объединение
+    };
+    // Знание о причуде только растёт — синхронизируем объединением (ИЛИ): что нашёл любой из двоих, видят оба
+    constexpr uint8_t QuirkDiagnosed = 1,        // SE_Quirk_MixAndMatch_C.Diagnosed
+        QuirkConditionPart = 2, QuirkConditionType = 4, // QuirkCondition.PartKnown / TypeKnown (BP_BaseQuirkElement_C)
+        QuirkBehaviorPart = 8, QuirkBehaviorType = 16;  // QuirkBehavior.PartKnown / TypeKnown
+    struct QuirkKnowBody
+    {
+        uint32_t Key;
+        uint8_t Known;
+    };
+
+    // Основание якоря (BP_Spawn_Anchor_Base_01_C) неподвижно и пришло в сейве Host — опознаётся по позиции, см
+    struct AnchorBody
+    {
+        int32_t X, Y, Z;
+    };
+    constexpr int32_t AnchorMatchCm = 300;
 
     // Дверь гаража (BP_GarageDoor_C): имена актёров у Host и Client могут разниться, позиция — нет (дверь неподвижна), см
     struct GarageDoorBody
@@ -186,6 +223,16 @@ namespace Coop
         bool operator==(const TrunkValue&) const = default;
     };
     constexpr size_t MaxTrunkValues = 8;
+
+    // Предмет, который игрок положил на землю (выбросил, снял деталь, достал из багажника): создаётся у собеседника в той же точке.
+    // Transform — FTransform как есть (3 × 4 float: поворот-кватернион, позиция, масштаб), дальше путь архетипа и ValueCount × TrunkValue
+    struct WorldItemBody
+    {
+        float Transform[12];
+        uint8_t CreateContext;
+        uint8_t PathLength;
+        uint8_t ValueCount;
+    };
 #pragma pack(pop)
 
     // CRC-32 (IEEE, как zlib.crc32) — проверка целостности файла после передачи
@@ -241,6 +288,31 @@ namespace Coop
         tail.resize(path.size() + values.size() * sizeof(TrunkValue));
         if (!values.empty()) std::memcpy(tail.data() + path.size(), values.data(), values.size() * sizeof(TrunkValue));
         return make_packet(id, sequence, TrunkItemBody{count, static_cast<uint8_t>(path.size()), static_cast<uint8_t>(values.size())}, tail.data(), tail.size());
+    }
+
+    inline std::vector<uint8_t> make_world_item_packet(uint32_t sequence, const WorldItemBody& body, const std::string& path, const std::vector<TrunkValue>& values)
+    {
+        if (path.empty() || path.size() > 255 || values.size() > MaxTrunkValues) return {};
+        std::vector<uint8_t> tail(path.begin(), path.end());
+        tail.resize(path.size() + values.size() * sizeof(TrunkValue));
+        if (!values.empty()) std::memcpy(tail.data() + path.size(), values.data(), values.size() * sizeof(TrunkValue));
+        WorldItemBody b = body;
+        b.PathLength = static_cast<uint8_t>(path.size());
+        b.ValueCount = static_cast<uint8_t>(values.size());
+        return make_packet(WorldItem, sequence, b, tail.data(), tail.size());
+    }
+
+    // false — мусор: обрезан, длины не сходятся, без архетипа
+    inline bool parse_world_item(const uint8_t* data, size_t size, WorldItemBody& body, std::string& path, std::vector<TrunkValue>& values)
+    {
+        auto* b = body_of<WorldItemBody>(data, size);
+        size_t offset = sizeof(Header) + sizeof(WorldItemBody);
+        if (!b || !b->PathLength || b->ValueCount > MaxTrunkValues || size != offset + b->PathLength + b->ValueCount * sizeof(TrunkValue)) return false;
+        body = *b;
+        path.assign(reinterpret_cast<const char*>(data + offset), b->PathLength);
+        values.assign(b->ValueCount, TrunkValue{});
+        if (b->ValueCount) std::memcpy(values.data(), data + offset + b->PathLength, b->ValueCount * sizeof(TrunkValue));
+        return true;
     }
 
     // false — мусор: обрезан, длины не сходятся, без архетипа, слишком много значений

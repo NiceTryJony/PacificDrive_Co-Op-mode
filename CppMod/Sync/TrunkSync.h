@@ -13,4 +13,5 @@ namespace TrunkSync
     void on_connected(bool is_host);                                                         // Host: новому клиенту — всё содержимое
     void on_map_loaded();
     void tick(bool is_host); // игровой поток
+    void describe();         // диагностика (Ctrl+F6): содержимое багажника, станции и гоблера в лог
 } // namespace TrunkSync
