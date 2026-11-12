@@ -3,9 +3,11 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 
 namespace Diag
 {
+    void init(const std::filesystem::path& coop_dir); // папка coop: запросы query.txt → ответы query_out.txt (см. Diag.cpp)
     extern std::atomic<bool> g_snapshot_requested; // Ctrl+F6 (поток клавиш → игровой поток)
     void tick(bool is_host);                       // игровой поток
 

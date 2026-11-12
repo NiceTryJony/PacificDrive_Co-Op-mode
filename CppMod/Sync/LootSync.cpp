@@ -4,6 +4,7 @@
 #include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -39,9 +41,13 @@ namespace LootSync
             Vec Position;         // при первом появлении — у собеседника в этот момент то же место
             UObject* InitialSlot; // слот при первом появлении — только для сравнения, не разыменовывается
             bool Done;            // подобран/убран — больше не следим
+            // Актёр в мире, чья гибель = «забрали»: деталь донора или ресурс, распиленные пилой (тест 2026-11-10: актёр пропал,
+            // а экземпляр жив и слот тот же — собеседник ничего не узнал). У предметов на земле пусто: их проявление игра выгружает сама
+            FWeakObjectPtr Actor{};
+            bool HasActor = false, HasInstance = true; // ресурс под распил (BP_Spawn_ResourceBase_C) — без экземпляра, только актёр
         };
 
-        constexpr uint64_t ScanIntervalMs = 2000, PollIntervalMs = 500, AfterLoadMs = 5000;
+        constexpr uint64_t ScanIntervalMs = 4000, PollIntervalMs = 500, AfterLoadMs = 5000;
         constexpr float OriginEpsilon = 100;         // см: ближе к (0,0,0) — не объект мира
         constexpr float DestroyedPickRadius = 1500;  // см: уничтожение дальше от игрока — не подбор
 
@@ -101,21 +107,32 @@ namespace LootSync
             }
         }
 
+        // Убрать у себя учтённое: экземпляр (с проявлением) и актёр, если тот остался (распиленная деталь, ресурс)
+        void remove_tracked(Tracked& item)
+        {
+            if (UObject* instance = item.HasInstance ? item.Instance.Get() : nullptr) remove_instance(instance);
+            if (UObject* actor = item.HasActor ? item.Actor.Get() : nullptr)
+            {
+                UFunctionCall destroy(actor, STR("K2_DestroyActor"));
+                if (destroy) destroy.call();
+            }
+        }
+
         StringType archetype_name(UObject* instance)
         {
             auto** archetype = property<UObject*>(instance, STR("Archetype"));
             return archetype && *archetype ? (*archetype)->GetName() : StringType{};
         }
 
-        // Ищет учтённый предмет и помечает снятым. Возвращает экземпляр, если он ещё жив
-        UObject* take_tracked(const Coop::LootBody& loot, bool* was_done = nullptr)
+        // Ищет учтённый предмет и помечает снятым; nullptr — такого в учёте нет
+        Tracked* take_tracked(const Coop::LootBody& loot, bool* was_done = nullptr)
         {
             for (auto& item : g_items)
             {
                 if (!matches(loot, item.Archetype, item.Position)) continue;
                 if (was_done) *was_done = item.Done;
                 item.Done = true;
-                return item.Instance.Get();
+                return &item;
             }
             return nullptr;
         }
@@ -131,25 +148,19 @@ namespace LootSync
 
         float distance_to_player(const Vec& p)
         {
-            Vec me = actor_location(UObjectGlobals::FindFirstOf(STR("BaseCharacter")));
+            Vec me = actor_location(Cached::character());
             float dx = p.X - me.X, dy = p.Y - me.Y, dz = p.Z - me.Z;
             return std::sqrt(dx * dx + dy * dy + dz * dz);
         }
 
         // Взять экземпляр в учёт. anchor — где он у собеседника тоже окажется: сам предмет, деталь машины или ящик
-        bool consider(UObject* instance, const Vec& anchor)
+        bool track(Tracked item)
         {
-            if (!instance || !g_seen.insert(instance).second) return false;
-            // В начале координат — служебные объекты не из мира (шаблоны машин в гараже, тест 2026-10-27)
-            if (std::fabs(anchor.X) + std::fabs(anchor.Y) + std::fabs(anchor.Z) < OriginEpsilon) return false;
-            auto slot = outer_slot(instance);
-            if (!slot) return false; // GetOuterSlot нет — подбор не отследить
-            Tracked item{FWeakObjectPtr(instance), fnv1a(archetype_name(instance)), anchor, *slot, false};
             // Собеседник уже забрал этот предмет, пока он был далеко от нас
             for (auto it = g_removed_by_peer.begin(); it != g_removed_by_peer.end(); ++it)
             {
                 if (!matches(*it, item.Archetype, item.Position)) continue;
-                remove_instance(instance);
+                remove_tracked(item);
                 g_removed_by_peer.erase(it);
                 item.Done = true;
                 break;
@@ -158,9 +169,33 @@ namespace LootSync
             return true;
         }
 
+        // actor — актёр, гибель которого тоже значит «забрали» (деталь донора); у остального nullptr
+        bool consider(UObject* instance, const Vec& anchor, UObject* actor = nullptr)
+        {
+            if (!instance || !g_seen.insert(instance).second) return false;
+            // В начале координат — служебные объекты не из мира (шаблоны машин в гараже, тест 2026-10-27)
+            if (std::fabs(anchor.X) + std::fabs(anchor.Y) + std::fabs(anchor.Z) < OriginEpsilon) return false;
+            auto slot = outer_slot(instance);
+            if (!slot) return false; // GetOuterSlot нет — подбор не отследить
+            Tracked item{FWeakObjectPtr(instance), fnv1a(archetype_name(instance)), anchor, *slot, false};
+            if (actor) item.Actor = FWeakObjectPtr(actor), item.HasActor = true;
+            return track(item);
+        }
+
+        // Ресурс под распил пилой (свинцовая плита, компьютер, радио…): экземпляра нет, опознаём по классу и месту
+        bool consider_resource(UObject* actor)
+        {
+            if (!actor || !g_seen.insert(actor).second) return false;
+            Vec at = actor_location(actor);
+            if (std::fabs(at.X) + std::fabs(at.Y) + std::fabs(at.Z) < OriginEpsilon) return false;
+            Tracked item{FWeakObjectPtr(), fnv1a(actor->GetClassPrivate()->GetName()), at, nullptr, false};
+            item.Actor = FWeakObjectPtr(actor), item.HasActor = true, item.HasInstance = false;
+            return track(item);
+        }
+
         void scan(bool is_host)
         {
-            int ground = 0, parts = 0, in_crates = 0;
+            int ground = 0, parts = 0, in_crates = 0, resources = 0;
             std::vector<UObject*> actors;
             // 1. Предметы на земле (у них bWorldOwned = 0 и слота нет — тест 2026-10-27)
             UObjectGlobals::FindAllOf(STR("ItemWorldManifestation"), actors);
@@ -175,8 +210,13 @@ namespace LootSync
             for (UObject* actor : actors)
             {
                 auto** instance = property<UObject*>(actor, STR("ItemInstance"));
-                if (instance && *instance && !g_seen.contains(*instance)) parts += consider(*instance, actor_location(actor));
+                if (instance && *instance && !g_seen.contains(*instance)) parts += consider(*instance, actor_location(actor), actor);
             }
+            // 2а. Ресурсы под распил (тест 2026-11-10 07:33: Host распилил свинцовую плиту — у Client осталась)
+            actors.clear();
+            UObjectGlobals::FindAllOf(STR("BP_Spawn_ResourceBase_C"), actors);
+            for (UObject* actor : actors)
+                if (!g_seen.contains(actor)) resources += consider_resource(actor);
             // 3. Содержимое ящиков/шкафчиков/рюкзаков: экземпляры в слотах InventoryContainer, якорь — сам ящик
             actors.clear();
             UObjectGlobals::FindAllOf(STR("BP_Lootable_Base_C"), actors);
@@ -211,13 +251,16 @@ namespace LootSync
             {
                 std::vector<UObject*> containers;
                 UObjectGlobals::FindAllOf(STR("ItemContainer"), containers);
+                std::unordered_multimap<UObject*, UObject*> by_outer; // Outer → контейнер: вместо перебора «багажники × контейнеры»
+                for (UObject* container : containers) by_outer.emplace(container->GetOuterPrivate(), container);
                 for (UObject* trunk : actors)
                 {
                     auto** owner = property<UObject*>(trunk, STR("ItemInstance"));
                     if (!owner || !*owner) continue;
-                    for (UObject* container : containers)
+                    auto range = by_outer.equal_range(*owner);
+                    for (auto it = range.first; it != range.second; ++it)
                     {
-                        if (container->GetOuterPrivate() != *owner) continue;
+                        UObject* container = it->second;
                         auto* slots = property<RawArray>(container, STR("Slots"));
                         Vec anchor{};
                         bool anchored = false;
@@ -234,9 +277,9 @@ namespace LootSync
                     }
                 }
             }
-            if (ground + parts + in_crates + in_trunks)
-                Output::send<LogLevel::Verbose>(STR("[Loot] в учёт: +{} на земле, +{} деталей машин, +{} в ящиках, +{} в багажниках доноров; всего {}\n"), ground, parts,
-                                                in_crates, in_trunks, g_items.size());
+            if (ground + parts + in_crates + in_trunks + resources)
+                Output::send<LogLevel::Verbose>(STR("[Loot] в учёт: +{} на земле, +{} деталей машин, +{} в ящиках, +{} в багажниках доноров, +{} ресурсов под распил; всего {}\n"),
+                                                ground, parts, in_crates, in_trunks, resources, g_items.size());
         }
 
         void poll(bool is_host)
@@ -244,28 +287,31 @@ namespace LootSync
             for (auto& item : g_items)
             {
                 if (item.Done) continue;
-                UObject* instance = item.Instance.Get();
+                UObject* instance = item.HasInstance ? item.Instance.Get() : nullptr;
+                bool picked = false; // слот сменился — предмет в чьём-то инвентаре
                 if (instance)
                 {
                     auto slot = outer_slot(instance);
-                    if (!slot || *slot == item.InitialSlot) continue;
+                    picked = slot && *slot != item.InitialSlot;
                 }
-                item.Done = true; // подобран (слот сменился) или уничтожен
+                bool sawn = item.HasActor && !item.Actor.Get(); // актёр детали/ресурса пропал — распилили или разобрали
+                if (!picked && !sawn && (instance || !item.HasInstance)) continue;
+                item.Done = true;
                 // Уничтожен вдали от игрока — это игра выгрузила/почистила, а не подбор: собеседнику не сообщаем
-                if (!instance && distance_to_player(item.Position) > DestroyedPickRadius) continue;
+                if (!picked && distance_to_player(item.Position) > DestroyedPickRadius) continue;
                 Coop::LootBody loot{item.Archetype, item.Position.X, item.Position.Y, item.Position.Z};
                 Net::send_loot(is_host ? Coop::LootPicked : Coop::InventoryAction, loot);
                 Output::send<LogLevel::Verbose>(STR("[Loot] {}: {} у ({:.0f}, {:.0f}, {:.0f})\n"), is_host ? STR("забрал Host") : STR("забрал я, сообщаю Host"),
-                                                instance ? archetype_name(instance) : STR("<уничтожен>"), loot.X, loot.Y, loot.Z);
+                                                picked ? archetype_name(instance) : sawn ? STR("<распилен/разобран>") : STR("<уничтожен>"), loot.X, loot.Y, loot.Z);
             }
         }
 
         // Убрать у себя предмет, который забрал собеседник (в мире он или уже у нас в инвентаре — неважно: прав Host)
         void remove_here(const Coop::LootBody& loot, const wchar_t* why)
         {
-            if (UObject* instance = take_tracked(loot))
+            if (Tracked* item = take_tracked(loot))
             {
-                remove_instance(instance);
+                remove_tracked(*item);
                 Output::send<LogLevel::Verbose>(STR("[Loot] убран предмет ({}) у ({:.0f}, {:.0f}, {:.0f})\n"), why, loot.X, loot.Y, loot.Z);
             }
             else
@@ -281,14 +327,14 @@ namespace LootSync
         {
             // Спека 3.4.2: Host проверяет, что предмет ещё не забран. Забран им самим — отказ, Client уберёт у себя
             bool host_took = false;
-            UObject* instance = take_tracked(loot, &host_took);
+            Tracked* item = take_tracked(loot, &host_took);
             if (host_took)
             {
                 Net::send_loot(Coop::LootDenied, loot);
                 Output::send<LogLevel::Verbose>(STR("[Loot] пассажир взял то, что уже у меня — отказ\n"));
                 return;
             }
-            if (instance) remove_instance(instance);
+            if (item) remove_tracked(*item);
             else g_removed_by_peer.push_back(loot);
             Output::send<LogLevel::Verbose>(STR("[Loot] пассажир забрал предмет у ({:.0f}, {:.0f}, {:.0f}) — убран у меня\n"), loot.X, loot.Y, loot.Z);
             return;
@@ -341,7 +387,7 @@ namespace LootSync
     {
         void simulate_peer_pick()
         {
-            UObject* character = UObjectGlobals::FindFirstOf(STR("BaseCharacter"));
+            UObject* character = Cached::character();
             UFunctionCall get_loc(character, STR("K2_GetActorLocation"));
             auto* me = get_loc ? get_loc.param<Vec>(STR("ReturnValue")) : nullptr;
             if (!me) return;
@@ -375,7 +421,7 @@ namespace LootSync
         }
         // До связи учёт не ведём: подобранное в одиночку собеседнику не важно (он загрузит наш сейв)
         if (!Net::connected() || now - g_map_loaded_ms < AfterLoadMs) return;
-        if (!UObjectGlobals::FindFirstOf(STR("BaseCharacter"))) return; // меню/загрузка
+        if (!Cached::character()) return; // меню/загрузка
         if (now - g_last_scan_ms >= ScanIntervalMs)
         {
             g_last_scan_ms = now;

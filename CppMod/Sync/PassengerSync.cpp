@@ -4,6 +4,7 @@
 #include <Unreal/UObjectGlobals.hpp>
 
 #include "Game/Items.h"
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 #include "Sync/CarSync.h"
@@ -137,7 +138,7 @@ namespace PassengerSync
             fade.call();
         }
 
-        UObject* own_character() { return UObjectGlobals::FindFirstOf(STR("BaseCharacter")); }
+        UObject* own_character() { return Cached::character(); }
 
         // Персонаж «в машине» по штатной логике игры: прикреплён (IsCharacterAttached) или PercentInCar > 0 — второе нужно
         // потому, что вход через дверь идёт таймлайном, и прикрепление может быть позже (тест 2026-10-30: Client сел за руль
@@ -184,6 +185,47 @@ namespace PassengerSync
             exit.call();
             show_hotbar();
             return true;
+        }
+
+        uint64_t g_describe_at = 0; // когда записать состояние персонажа после «Exit Car» от сторожа
+
+        // Состояние персонажа для разбора «Client прикован к месту, меню Esc сломано» (2026-11-12): таймлайны входа/выхода, режим движения,
+        // игнор ввода, к чему прикреплён корень. Ничего не меняет
+        void log_character_state(const TCHAR* tag)
+        {
+            UObject* character = own_character();
+            if (!character)
+            {
+                Output::send<LogLevel::Verbose>(STR("[Passenger] состояние ({}): персонажа нет\n"), tag);
+                return;
+            }
+            auto timeline = [&](const TCHAR* name) {
+                auto** t = property<UObject*>(character, name);
+                UFunctionCall fn(t ? *t : nullptr, STR("IsPlaying"));
+                auto* r = fn ? fn.param<bool>(STR("ReturnValue")) : nullptr;
+                if (!r) return -1;
+                fn.call();
+                return *r ? 1 : 0;
+            };
+            auto flag = [&](UObject* object, const TCHAR* function) {
+                UFunctionCall fn(object, function);
+                auto* r = fn ? fn.param<bool>(STR("ReturnValue")) : nullptr;
+                if (!r) return -1;
+                fn.call();
+                return *r ? 1 : 0;
+            };
+            auto** movement = property<UObject*>(character, STR("CharacterMovement"));
+            auto* mode = movement && *movement ? property<uint8_t>(*movement, STR("MovementMode")) : nullptr;
+            auto** controller = property<UObject*>(character, STR("Controller"));
+            UObject* ctrl = controller ? *controller : nullptr;
+            auto** root = property<UObject*>(character, STR("RootComponent"));
+            auto** parent = root && *root ? property<UObject*>(*root, STR("AttachParent")) : nullptr;
+            CarState car = character_car_state(character);
+            Output::send<LogLevel::Verbose>(STR("[Passenger] состояние ({}): прикреплён={} в машине {:.2f}, к {}; таймлайны (1 идёт): вход {} выход {} затемнение выхода {} затемнение входа {}; "
+                                                "режим движения {}, игнор движения {} взгляда {}; g_seat={}\n"),
+                                            tag, car.Attached, car.Percent, parent && *parent ? (*parent)->GetFullName() : StringType(STR("ничего")), timeline(STR("EnterCarTimeline")),
+                                            timeline(STR("ExitCarTimeline")), timeline(STR("ExitCar_FadeToBlackTimeline")), timeline(STR("EnterCarDipToBlack")),
+                                            mode ? static_cast<int>(*mode) : -1, flag(ctrl, STR("IsMoveInputIgnored")), flag(ctrl, STR("IsLookInputIgnored")), g_seat);
         }
 
         template <typename T>
@@ -244,6 +286,48 @@ namespace PassengerSync
                 return name == STR("Highlight_LeftHandle") || name == STR("Highlight_RightHandle");
             }
             return false;
+        }
+
+        // Защита от радиации: игра даёт её игроку «в машине» по доле GetPlayerInCarPercent (тест 0.17.4 2026-11-07: водитель —
+        // 1.00 и playerProtected=1, сидящий пассажир — 0.00 и 0, радиация приходит обоим). Пока пассажир сидит, отвечаем 1.0
+        struct InCarHook
+        {
+            const TCHAR* cls;
+            const TCHAR* param;
+            FProperty* prop = nullptr;
+            size_t offset = SIZE_MAX;
+            bool done = false;
+        };
+        InCarHook g_in_car[] = {{STR("PDP_MainCharacter_C"), STR("In Car percent")}, {STR("BP_MainCharacterManager_C"), STR("Percent")}};
+
+        template <size_t I>
+        void install_in_car_percent()
+        {
+            auto& h = g_in_car[I];
+            if (h.done) return;
+            auto* object = UObjectGlobals::FindFirstOf(h.cls);
+            UFunction* fn = object ? object->GetFunctionByNameInChain(STR("GetPlayerInCarPercent")) : nullptr;
+            if (!fn) return; // ещё не появился — попробуем при следующей посадке
+            h.done = true;
+            for (FProperty* p : TFieldRange<FProperty>(fn, EFieldIterationFlags::IncludeDeprecated))
+                if (p->GetName() == h.param) h.prop = p, h.offset = static_cast<size_t>(p->GetOffset_ForInternal());
+            if (h.offset == SIZE_MAX)
+            {
+                Output::send<LogLevel::Warning>(STR("[Passenger] у {}.GetPlayerInCarPercent нет параметра «{}» — защита пассажира от радиации не включена\n"), h.cls, h.param);
+                return;
+            }
+            UObjectGlobals::RegisterHook(
+                    object->GetClassPrivate()->GetPathName() + STR(":GetPlayerInCarPercent"), [](UnrealScriptFunctionCallableContext&, void*) {},
+                    [](UnrealScriptFunctionCallableContext& context, void*) {
+                        if (g_seat < 0) return;
+                        auto& h = g_in_car[I];
+                        auto* locals = static_cast<uint8_t*>(context.TheStack.Locals());
+                        auto* percent = static_cast<float*>(FindOutParamValueAddress(context.TheStack, h.prop));
+                        if (!percent && locals) percent = reinterpret_cast<float*>(locals + h.offset);
+                        if (percent) *percent = 1.0f;
+                    },
+                    nullptr);
+            Output::send<LogLevel::Verbose>(STR("[Passenger] сидящий пассажир «в машине» для {}.GetPlayerInCarPercent (защита от радиации)\n"), h.cls);
         }
 
         void install_highlight_filter()
@@ -495,6 +579,8 @@ namespace PassengerSync
             Presence::set_seated(true);
             car_audio_inside(CarSync::puppet_car(), true);
             install_highlight_filter();
+            install_in_car_percent<0>();
+            install_in_car_percent<1>();
             if (g_anim.active) step_anim(character);
             else follow_car(character);
             Output::send<LogLevel::Verbose>(STR("[Passenger] сел на задний {}: водитель в осях машины ({:.0f}, {:.0f}, {:.0f}), место ({:.0f}, {:.0f}, {:.0f})\n"),
@@ -507,7 +593,7 @@ namespace PassengerSync
             if (character)
             {
                 UObject* car = CarSync::puppet_car();
-                if (!car) car = UObjectGlobals::FindFirstOf(STR("NewVehiclePawn"));
+                if (!car) car = Cached::car();
                 Coop::CarStateBody pose{};
                 bool have_pose = CarSync::puppet_pose(pose);
                 Vec exit;
@@ -618,7 +704,7 @@ namespace PassengerSync
                 return;
             }
             if (id != Coop::RequestSeat) return;
-            UObject* car = UObjectGlobals::FindFirstOf(STR("NewVehiclePawn"));
+            UObject* car = Cached::car();
             Coop::SeatBody reply{request.Seat, Coop::SeatNoCar};
             if (car)
             {
@@ -771,6 +857,11 @@ namespace PassengerSync
         }
         // Штатный вход в машину-куклу ломает игрока (падение под карту, потеря управления) — сразу выходим штатно же
         uint64_t now = now_ms();
+        if (g_describe_at && now >= g_describe_at)
+        {
+            g_describe_at = 0;
+            log_character_state(STR("через 2 с после Exit Car"));
+        }
         if (!CarSync::puppet_car() || now - g_last_guard_ms < GuardIntervalMs) return;
         g_last_guard_ms = now;
         UObject* character = own_character();
@@ -785,8 +876,12 @@ namespace PassengerSync
         if (g_guard_attempts >= 5 || now - g_last_exit_ms < 1000) return;
         g_last_exit_ms = now;
         ++g_guard_attempts;
+        log_character_state(STR("до Exit Car"));
         bool called = force_exit_car(character);
         Output::send<LogLevel::Verbose>(STR("[Passenger] штатный вход в машину Host заблокирован ({}): прикреплён={}, в машине {:.2f}, попытка {} — садитесь Ctrl+E\n"),
                                         called ? STR("Exit Car вызван") : STR("Exit Car НЕ найден"), state.Attached, state.Percent, g_guard_attempts);
+        g_describe_at = now + 2000;
     }
+
+    void describe() { log_character_state(STR("Ctrl+F6")); }
 } // namespace PassengerSync

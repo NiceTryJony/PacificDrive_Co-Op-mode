@@ -31,8 +31,22 @@ namespace RadioSync
         std::string g_waiting, g_waiting_name; // Client: трек Хоста, файла которого у нас ещё нет
         int64_t g_waiting_check_ms = 0;
 
-        // Есть ли файл трека в папке своих треков игры (%LOCALAPPDATA%\PenDriverPro\Custom\Radio). Имя — хвост ExternalUrl
-        // Хоста в UTF-8, возможны %XX
+        // Папка, откуда Client играет треки Хоста: лаунчер пишет путь в coop\music_dir.txt (UTF-8, прямые слэши); нет файла —
+        // %LOCALAPPDATA%\PenDriverPro\Custom\Radio (без лаунчера и у Host)
+        std::filesystem::path music_dir()
+        {
+            std::ifstream f(g_host_file.parent_path() / "music_dir.txt", std::ios::binary);
+            std::string d;
+            if (f && std::getline(f, d))
+            {
+                while (!d.empty() && (d.back() == '\r' || d.back() == '/' || d.back() == ' ')) d.pop_back();
+                if (d.size() > 2 && d[1] == ':') return std::filesystem::path(reinterpret_cast<const char8_t*>(d.c_str()));
+            }
+            const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
+            return local ? std::filesystem::path(local) / L"PenDriverPro" / L"Custom" / L"Radio" : std::filesystem::path();
+        }
+
+        // Есть ли файл трека в этой папке. Имя — хвост ExternalUrl Хоста в UTF-8, возможны %XX
         bool have_track(const std::string& name)
         {
             std::string plain;
@@ -45,12 +59,10 @@ namespace RadioSync
                 }
                 else plain += name[i];
             }
-            const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
-            if (!local || plain.empty() || plain.find_first_of("/\\") != std::string::npos) return false;
+            auto dir = music_dir();
+            if (dir.empty() || plain.empty() || plain.find_first_of("/\\") != std::string::npos) return false;
             std::error_code ec;
-            return std::filesystem::exists(std::filesystem::path(local) / L"PenDriverPro" / L"Custom" / L"Radio" /
-                                                   std::filesystem::path(reinterpret_cast<const char8_t*>(plain.c_str())),
-                                           ec);
+            return std::filesystem::exists(dir / std::filesystem::path(reinterpret_cast<const char8_t*>(plain.c_str())), ec);
         }
     } // namespace
 

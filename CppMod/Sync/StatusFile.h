@@ -1,4 +1,4 @@
-// Состояние мода для окна в терминале (tools/CoopConsole): текстовый файл key=value, раз в секунду. Формат — docs/WORKFLOW.md «Окно в терминале».
+// Состояние мода для окна в терминале (tools/CoopConsole): текстовый файл key=value, раз в секунду. Формат — docs/workflow/WORKFLOW.md «Окно в терминале».
 #pragma once
 #include <filesystem>
 #include <string>

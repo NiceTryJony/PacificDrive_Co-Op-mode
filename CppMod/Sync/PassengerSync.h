@@ -15,4 +15,5 @@ namespace PassengerSync
     // из coop.ini: левое место — seat_x/y/z, правое — seat_right_x/y/z (см от точки водителя; у правого — отражённой через ось машины)
     void set_seat_offsets(float left_x, float left_y, float left_z, float right_x, float right_y, float right_z);
     void tick(bool is_host); // игровой поток
+    void describe();         // Ctrl+F6 (Diag): состояние персонажа — прикреплён, таймлайны входа/выхода, режим движения, игнор ввода
 } // namespace PassengerSync

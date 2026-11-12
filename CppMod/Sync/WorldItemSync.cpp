@@ -7,6 +7,7 @@
 
 #include "Game/ItemProps.h"
 #include "Game/Items.h"
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 
@@ -70,7 +71,7 @@ namespace WorldItemSync
 
         int64_t now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-        UObject* character() { return UObjectGlobals::FindFirstOf(STR("BaseCharacter")); }
+        UObject* character() { return Cached::character(); }
 
         Vec actor_location(UObject* actor)
         {

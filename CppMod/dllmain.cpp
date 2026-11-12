@@ -1,5 +1,5 @@
 // Pacific Drive Coop — C++ часть (спека, раздел 5).
-// Этап 0: ZoneSave (F10, Host сохраняет зону) + ZoneLoad (F11, Client загружает её) — риск 6.2, docs/SEED_SYNC.md.
+// Этап 0: ZoneSave (F10, Host сохраняет зону) + ZoneLoad (F11, Client загружает её) — риск 6.2, docs/archive/SEED_SYNC.md.
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Unreal/UObjectGlobals.hpp>
@@ -29,6 +29,9 @@
 #include "Sync/QuirkSync.h"
 #include "Sync/AnchorSync.h"
 #include "Sync/RadioSync.h"
+#include "Sync/HeapGuard.h"
+#include "Sync/GateSync.h"
+#include "Sync/WeatherSync.h"
 #include "Sync/WorldItemSync.h"
 #include "Sync/LootSync.h"
 #include "Sync/PassengerSync.h"
@@ -95,7 +98,7 @@ namespace ZoneSave
             Output::send<LogLevel::Error>(STR("[ZoneSave] нет BaseSaveGameManager/SaveGame/параметров — сохранение НЕ вызвано\n"));
             return;
         }
-        // Содержимое ящиков «при открытии» — разыграть до сейва, иначе у Client оно будет своё (docs/DECISIONS.md)
+        // Содержимое ящиков «при открытии» — разыграть до сейва, иначе у Client оно будет своё (docs/design/DECISIONS.md)
         if (g_net_config.role == Net::Role::Host) LootSync::preroll_containers();
         // Пишем в текущий слот игрока — ровно то же, что делает игра при выходе в меню
         *p_slot = g_slot = *slot;
@@ -242,7 +245,7 @@ namespace ZoneLoad
             Output::send<LogLevel::Error>(STR("[ZoneLoad] нет {} — нечего загружать\n"), ZoneSave::ZoneFile.wstring());
             return;
         }
-        // Свой инвентарь: берём из кооп-слота Client до его удаления и переносим в присланную зону (DECISIONS.md 2026-10-30).
+        // Свой инвентарь: берём из кооп-слота Client до его удаления и переносим в присланную зону (docs/design/DECISIONS.md 2026-10-30).
         // Любая ошибка — грузим зону как есть: зона важнее инвентаря
         std::vector<uint8_t> merged = zone_with_own_inventory(slot);
 
@@ -306,9 +309,9 @@ namespace ZoneLoad
 } // namespace ZoneLoad
 
 // AutoSave: Host после каждой загрузки карты ждёт, пока спавн (USpawnHistory::IsSpawnSystemRunning) затихнет, и один раз
-// сохраняет и шлёт клиенту. Спавн амортизирован и идёт секунды после загрузки — сохраняться раньше нельзя (docs/SEED_SYNC.md).
+// сохраняет и шлёт клиенту. Спавн амортизирован и идёт секунды после загрузки — сохраняться раньше нельзя (docs/archive/SEED_SYNC.md).
 // Зона из сейва (продолжение заезда) спавна не запускает вовсе — поэтому критерий «тихо N опросов», а не «спавн закончился».
-// Гараж тоже отправляется: клиент получает тот же гараж (SessionStart, docs/SAVES.md).
+// Гараж тоже отправляется: клиент получает тот же гараж (SessionStart, docs/sync/SAVES.md).
 namespace AutoSave
 {
     constexpr uint64_t PollMs = 500, MinAfterLoadMs = 3000;
@@ -378,6 +381,37 @@ namespace AutoSave
 
 std::string g_version; // ModVersion для окна статуса
 
+// Живые настройки: лаунчер правит coop.ini, пока игра идёт. Раз в секунду смотрим время изменения файла и применяем то, что можно без
+// перезапуска (правила пассажира, оверлей). Роль, адрес и порт читаются только при старте.
+namespace LiveConfig
+{
+    void tick()
+    {
+        static auto last = std::chrono::steady_clock::now();
+        static std::filesystem::file_time_type seen{};
+        auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(1)) return;
+        last = now;
+        std::error_code ec;
+        auto path = ZoneSave::CoopDir.parent_path() / "coop.ini";
+        auto t = std::filesystem::last_write_time(path, ec);
+        if (ec || t == seen) return;
+        seen = t;
+        auto c = Net::load_config(path);
+        g_net_config.status_overlay = c.status_overlay;
+        g_net_config.restrict_interactions = c.restrict_interactions;
+        g_net_config.camera_follow = c.camera_follow;
+        g_net_config.exit_side_cm = c.exit_side_cm;
+        g_net_config.client_parts = c.client_parts;
+        PassengerSync::set_restrict_interactions(c.restrict_interactions);
+        PassengerSync::set_camera_follow(c.camera_follow);
+        PassengerSync::set_exit_side_cm(c.exit_side_cm);
+        PartsSync::set_client_parts(c.client_parts);
+        Output::send<LogLevel::Verbose>(STR("[Config] live settings applied: doors-only={} camera-follows={} exit={} cm passenger-parts={} overlay={}\n"), c.restrict_interactions, c.camera_follow, c.exit_side_cm,
+                                        c.client_parts, c.status_overlay);
+    }
+} // namespace LiveConfig
+
 // Надпись поверх игры (Game/StatusOverlay), текст для игрока — по-английски. Только Client: Host ничего не ждёт.
 namespace Overlay
 {
@@ -430,7 +464,7 @@ public:
     PacificDriveCoop() : CppUserModBase()
     {
         ModName = STR("PacificDriveCoop");
-        ModVersion = STR("0.17.3");
+        ModVersion = STR("0.17.19");
         for (auto c : ModVersion) g_version += static_cast<char>(c); // версия — ASCII
         ModDescription = STR("2-player LAN coop: driver + passenger");
         ModAuthors = STR("sanokoo");
@@ -445,6 +479,7 @@ public:
         register_keydown_event(Input::Key::F5, {Input::ModifierKey::CONTROL}, [] { g_dump_object = true; });
         register_keydown_event(Input::Key::F6, {Input::ModifierKey::CONTROL}, [] { Diag::g_snapshot_requested = true; }); // полный срез в лог
         register_keydown_event(Input::Key::F9, {Input::ModifierKey::CONTROL}, [] { g_selftest_item_props = true; }); // самопроверка записи свойств
+        register_keydown_event(Input::Key::F7, {Input::ModifierKey::CONTROL}, [] { ZoneTrace::g_mark_requested = true; }); // метка «здесь что-то не так»
         Output::send<LogLevel::Verbose>(STR("[PacificDriveCoop] {} loaded, Ctrl+F10 = сохранить зону, Ctrl+F11 = загрузить зону (клиент), Ctrl+E = сесть/выйти (пассажир)\n"), ModVersion);
     }
 
@@ -452,6 +487,7 @@ public:
     {
         if (ZoneSave::g_tick_id) Hook::UnregisterCallback(ZoneSave::g_tick_id);
         if (m_load_map_id) Hook::UnregisterCallback(m_load_map_id);
+        if (m_load_map_pre_id) Hook::UnregisterCallback(m_load_map_pre_id);
         ZoneTrace::uninstall();
         Net::stop();
         StatusOverlay::stop();
@@ -489,7 +525,14 @@ public:
         g_net_events.on_quirk_set = QuirkSync::on_quirk_set;
         g_net_events.on_quirk_cure = QuirkSync::on_quirk_cure;
         g_net_events.on_quirk_know = QuirkSync::on_quirk_know;
-        g_net_events.on_anchor = AnchorSync::on_anchor;
+        g_net_events.on_anchor = [](Coop::PacketId id, const Coop::AnchorBody& body) { // якорь, портал выхода, метка Ctrl+F7
+            if (id == Coop::Mark) ZoneTrace::on_peer_mark(body);
+            else AnchorSync::on_anchor(id, body);
+        };
+        g_net_events.on_hazard = AnchorSync::on_hazard; // аномалии от взятия якоря
+        g_net_events.on_census = ZoneTrace::on_peer_census; // сверка зоны
+        g_net_events.on_weather = WeatherSync::on_weather;
+        g_net_events.on_gate = GateSync::on_gate;
         g_net_events.on_radio = RadioSync::on_radio;
         g_net_events.on_world_item = WorldItemSync::on_world_item;
         g_net_events.on_zone_save = [](std::vector<uint8_t>&& file) {
@@ -502,6 +545,7 @@ public:
         };
         Notify::init(ZoneSave::CoopDir / "notify.txt");
         RadioSync::init(ZoneSave::CoopDir);
+        Diag::init(ZoneSave::CoopDir);
         g_net_config = Net::load_config(ZoneSave::CoopDir.parent_path() / "coop.ini");
         PassengerSync::set_seat_offsets(g_net_config.seat_x, g_net_config.seat_y, g_net_config.seat_z, g_net_config.seat_right_x, g_net_config.seat_right_y,
                                         g_net_config.seat_right_z);
@@ -533,7 +577,11 @@ public:
                     Diag::perf(13, [&] { QuirkSync::tick(host); });
                     Diag::perf(14, [&] { AnchorSync::tick(host); });
                     Diag::perf(15, [&] { ZoneTrace::tick(); });
+                    LiveConfig::tick();
                     RadioSync::tick(host);
+                    WeatherSync::tick(host);
+                    GateSync::tick(host);
+                    HeapGuard::tick(host, g_net_config.heap_test);
                     WorldItemSync::tick(host);
                     Notify::tick(Net::connected(), host, DoorSync::known_mask());
                     Diag::perf_report();
@@ -547,9 +595,13 @@ public:
                     ZoneLoad::tick();
                 },
                 {false, false, STR("PacificDriveCoop"), STR("ZoneSave")});
+        m_load_map_pre_id = Hook::RegisterLoadMapPreCallback(
+                [](Hook::TCallbackIterationData<bool>&, UEngine*, FWorldContext&, FURL, UPendingNetGame*, FString&) { AnchorSync::on_map_loading(); },
+                {false, true, STR("PacificDriveCoop"), STR("MapLoading")});
         m_load_map_id = Hook::RegisterLoadMapPostCallback(
                 [](Hook::TCallbackIterationData<bool>&, UEngine*, FWorldContext&, FURL, UPendingNetGame*, FString&) {
                     AutoSave::g_map_loaded = true;
+                    UFunctionCall::clear_cache();
                     Overlay::on_map_loaded();
                     Presence::on_map_loaded();
                     CarSync::on_map_loaded();
@@ -563,16 +615,19 @@ public:
                     ZoneTrace::on_map_loaded();
                     QuirkSync::on_map_loaded();
                     AnchorSync::on_map_loaded();
+                    WeatherSync::on_map_loaded();
+                    GateSync::on_map_loaded();
                     WorldItemSync::on_map_loaded();
                 },
                 {false, true, STR("PacificDriveCoop"), STR("AutoSave")});
         ZoneTrace::install(g_net_config.role == Net::Role::Host);
+        AnchorSync::install();
         Output::send<LogLevel::Verbose>(STR("[PacificDriveCoop] хуки: EngineTick {}, LoadMap {}\n"), ZoneSave::g_tick_id ? STR("есть") : STR("НЕТ"),
                                         m_load_map_id ? STR("есть") : STR("НЕТ"));
     }
 
 private:
-    Hook::GlobalCallbackId m_load_map_id{};
+    Hook::GlobalCallbackId m_load_map_id{}, m_load_map_pre_id{};
 };
 
 extern "C"

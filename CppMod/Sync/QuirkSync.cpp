@@ -106,7 +106,30 @@ namespace QuirkSync
             uint8_t bits = 0;
             for (auto& f : Flags)
                 if (auto* v = flag_of(quirk, f); v && *v) bits |= f.bit;
+            for (uint8_t c = 0; c < Coop::QuirkCategories; ++c)
+            {
+                UFunctionCall fn(quirk, STR("IsQuirkKnown"));
+                auto* category = fn ? fn.param<uint8_t>(STR("Detective Category")) : nullptr;
+                auto* full = fn ? fn.param<bool>(STR("FullyKnown")) : nullptr;
+                if (!category || !full) break;
+                *category = c;
+                fn.call();
+                if (*full) bits |= static_cast<uint8_t>(Coop::QuirkFullyKnown0 << c);
+            }
             return bits;
+        }
+
+        // Штатное «решение найдено» в категории (то, что игра делает после диагностики); false — функции нет
+        bool fully_learn(UObject* quirk, uint8_t category_index, bool via_diagnosis)
+        {
+            UFunctionCall fn(quirk, STR("FullyLearnQuirk"));
+            auto* category = fn ? fn.param<uint8_t>(STR("Detective Category")) : nullptr;
+            auto* via = fn ? fn.param<bool>(STR("ViaDiagnosis")) : nullptr;
+            if (!category || !via) return false;
+            *category = category_index;
+            *via = via_diagnosis;
+            fn.call();
+            return true;
         }
 
         // Добавить знание (только поднимаем флаги — забыть найденное нельзя). Возвращает, что реально добавилось
@@ -116,6 +139,16 @@ namespace QuirkSync
             for (auto* q : quirks())
             {
                 if (key_of(q) != key) continue;
+                uint8_t have = known_of(q);
+                // Диагноз собеседника = решение найдено целиком: открываем все категории (сам флаг Diagnosed панель не читает)
+                uint8_t want = bits;
+                if (bits & Coop::QuirkDiagnosed)
+                    for (uint8_t c = 0; c < Coop::QuirkCategories; ++c) want |= static_cast<uint8_t>(Coop::QuirkFullyKnown0 << c);
+                for (uint8_t c = 0; c < Coop::QuirkCategories; ++c)
+                {
+                    auto bit = static_cast<uint8_t>(Coop::QuirkFullyKnown0 << c);
+                    if ((want & bit) && !(have & bit) && fully_learn(q, c, bits & Coop::QuirkDiagnosed)) added |= bit;
+                }
                 for (auto& f : Flags)
                     if (auto* v = flag_of(q, f); v && (bits & f.bit) && !*v)
                     {
@@ -141,6 +174,23 @@ namespace QuirkSync
             for (auto* q : quirks())
             {
                 if (key_of(q) != key) continue;
+                // CureCarQuirk — лечение «от игрока»: без расходников в багажнике отказывает, а с ними тратит их второй раз
+                // (тесты 2026-11-09 08:09/08:12 и 2026-11-10 07:18: «НЕ вышло» / «готово» + лишний расход Fix*). Собеседник уже
+                // заплатил — снимаем сам эффект родным UBaseStatusEffectManager.RemoveStatusEffect
+                size_t before = quirks().size();
+                UFunctionCall remove(manager(), STR("RemoveStatusEffect"));
+                if (auto* effect = remove ? remove.param<UObject*>(STR("StatusEffect")) : nullptr)
+                {
+                    *effect = q;
+                    remove.call();
+                }
+                if (quirks().size() == before)
+                {
+                    UFunctionCall clean(manager(), STR("CleanCachedQuirks")); // эффект снят, а в CarQuirks остался указатель
+                    if (clean) clean.call();
+                }
+                if (quirks().size() < before) return true;
+                Output::send<LogLevel::Warning>(STR("[Quirk] RemoveStatusEffect причуду не снял — пробую CureCarQuirk\n"));
                 UFunctionCall fn(manager(), STR("CureCarQuirk"));
                 auto* target = fn ? fn.param<UObject*>(STR("QuirkToCure")) : nullptr;
                 auto* removed = fn ? fn.param<bool>(STR("Removed")) : nullptr;
@@ -186,9 +236,11 @@ namespace QuirkSync
             {
                 bool ok = cure(key);
                 Output::send<LogLevel::Verbose>(STR("[Quirk] Host вылечил «{}» — лечу у себя: {}\n"), name_of(key), ok ? STR("готово") : STR("НЕ вышло"));
+                // Это лечение — не моё действие: вычитаем из своего счёта, Host-у не сообщаем. Весь счёт здесь не обновляем:
+                // набор Host приходит каждые 10 с и затирал моё лечение, которого опрос ещё не видел (тест 2026-11-10 07:18:23)
+                if (auto it = g_mine.find(key); ok && it != g_mine.end() && it->second > 0) --it->second;
             }
         }
-        g_mine = current(); // своё лечение выше — не моё действие, Host-у не сообщаем
     }
 
     void on_quirk_cure(const Coop::QuirkBody& body)

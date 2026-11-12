@@ -1,4 +1,4 @@
-// Инвентарь игрока внутри сейва: рюкзак, рука, ячейки быстрого выбора (RECON.md «5b.8», DECISIONS.md 2026-10-30).
+// Инвентарь игрока внутри сейва: рюкзак, рука, ячейки быстрого выбора (RECON.md «5b.8», docs/design/DECISIONS.md 2026-10-30).
 // Чистый C++ без Unreal. Python-эталон: tools/sav_inventory.py.
 #pragma once
 #include "Game/SaveObjects.h"

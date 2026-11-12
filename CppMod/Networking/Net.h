@@ -1,8 +1,9 @@
-// Сеть мода поверх ENet (docs/DECISIONS.md «Транспорт: ENet»). Без заголовков UE4SS: winsock из ENet с ними конфликтует.
+// Сеть мода поверх ENet (docs/design/DECISIONS.md «Транспорт: ENet»). Без заголовков UE4SS: winsock из ENet с ними конфликтует.
 #pragma once
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,10 @@ namespace Net
         // Детали машины, которые пассажир ставит/снимает на своей копии, уходят Host-у (CarPartRequest). 0 — запрет:
         // Client откатывает свою правку к состоянию Host, Host запросы игнорирует
         bool client_parts = true;
+        // Тест досылки: доля (%) unreliable-пакетов (поза, машина), которые сеть «теряет» при отправке; 0 — выключено (coop.ini: sim_loss)
+        float sim_loss_percent = 0;
+        // Тест на одном ПК: HeapGuard ведёт себя как у Client, даже если игра — Host (coop.ini: heap_test=1)
+        bool heap_test = false;
     };
 
     struct Events
@@ -62,8 +67,19 @@ namespace Net
         std::function<void(const Coop::QuirkKnowBody&)> on_quirk_know; // Host: пассажир выяснил о причуде
         std::function<void(const Coop::WorldItemBody&, const std::string&, const std::vector<Coop::TrunkValue>&)> on_world_item; // собеседник положил предмет на землю
         std::function<void(const std::string&, const std::string&)> on_radio; // Client: текущий трек радио Host (вид, имя)
-        std::function<void(const Coop::AnchorBody&)> on_anchor;       // якорь в этой точке взял собеседник
+        std::function<void(const std::string&, const std::string&)> on_weather; // Client: погода Host-а — тег "wev" + путь класса WEV_* / "lvl" + уровни
+        std::function<void(const std::string&, const std::string&)> on_gate; // оба: ворота выезда гаража у собеседника (тег "gate", "1"/"0")
+        std::function<void(Coop::PacketId, const Coop::AnchorBody&)> on_anchor; // AnchorTaken — якорь взял собеседник, PortalActive — активировал портал
+        std::function<void(const std::string&, const std::string&)> on_census; // оба: срез зоны собеседника (карта, «Класс=число …»)
+        std::function<void(const std::string&, const std::string&)> on_hazard; // Client: аномалия Host-а от якоря (позиция и поворот текстом, путь класса)
     };
+
+    // Реестр: модуль сам подписывается на свои пакеты (игровой поток, из tick). body — после заголовка. Пакет без подписчика и без поля в Events — «неизвестный».
+    // Новые синхронизации — только так: ни Events, ни switch в Net.cpp править не нужно. Класс приоритета и ключ слияния — Coop::priority_of / key
+    using Handler = std::function<void(const uint8_t* body, size_t size)>;
+    void on(Coop::PacketId id, Handler handler);
+    // key != 0: пока предыдущий пакет с этим ключом не ушёл, он заменяется этим (состояние «последнее побеждает»)
+    void send(Coop::PacketId id, const std::vector<uint8_t>& payload, uint64_t key = 0);
 
     // coop.ini: строки key=value — role=host|client|off, host_ip=..., port=..., seat_x/seat_y/seat_z=...
     Config load_config(const std::filesystem::path& path);
@@ -71,6 +87,7 @@ namespace Net
     void stop();
     // shortcut: ENet обслуживается из игрового тика (не свой поток) — хватает при длинных таймаутах; поток — если начнёт рваться связь
     void tick(const Events& events);
+    uint32_t adaptive_interval_ms(uint32_t base_ms); // base_ms, а при плохой связи (rtt/потери) вдвое-полтора больше
     bool connected();
     int zone_progress();    // Client: сколько процентов сейва зоны уже принято; -1 — приёма сейчас нет
     int rtt_ms();           // -1 — нет связи
@@ -91,7 +108,7 @@ namespace Net
     void send_quirk_cure(const Coop::QuirkBody& body);              // reliable, Client
     void send_quirk_know(const Coop::QuirkKnowBody& body);          // reliable, Client
     bool send_world_item(const Coop::WorldItemBody& body, const std::string& path, const std::vector<Coop::TrunkValue>& values); // reliable, оба
-    void send_anchor(const Coop::AnchorBody& body);                 // reliable, оба
+    void send_anchor(const Coop::AnchorBody& body, Coop::PacketId id = Coop::AnchorTaken); // reliable, оба; PortalActive — тем же телом
     void send_garage_door(Coop::PacketId id, const Coop::GarageDoorBody& body); // reliable: GarageDoor (Host) / GarageDoorRequest (Client)
     // reliable; CarPart — Host → Client, CarPartRequest — Client → Host; false — не влезло в пакет
     bool send_part(const std::string& tag, const std::string& path, Coop::PacketId id = Coop::CarPart);

@@ -3,6 +3,7 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 
@@ -134,7 +135,7 @@ namespace CarSync
             return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
         }
 
-        UObject* find_car() { return UObjectGlobals::FindFirstOf(STR("NewVehiclePawn")); } // BP_PlayerCarNew_C : ANewVehiclePawn
+        UObject* find_car() { return Cached::car(); } // BP_PlayerCarNew_C : ANewVehiclePawn
 
         void set_simulate_physics(UObject* car, bool simulate)
         {
@@ -259,7 +260,7 @@ namespace CarSync
                 Vec car_at = actor_location(g_car);
                 auto ground = ground_z(g_car, car_at);
                 g_ground_offset = ground ? std::optional<float>(car_at.Z - *ground) : std::nullopt;
-                UObject* character = UObjectGlobals::FindFirstOf(STR("BaseCharacter"));
+                UObject* character = Cached::character();
                 Output::send<LogLevel::Verbose>(STR("[CarSync] до захвата: машина z={:.0f}, земля z={}, персонаж z={:.0f}\n"), car_at.Z,
                                                 ground ? std::to_wstring(static_cast<int>(*ground)) : std::wstring(L"?"), character ? actor_location(character).Z : 0.0f);
                 set_simulate_physics(g_car, false);
@@ -341,7 +342,7 @@ namespace CarSync
             return;
         }
         uint64_t now = now_ms();
-        if (now - g_last_send_ms < Coop::CarStateIntervalMs) return;
+        if (now - g_last_send_ms < Net::adaptive_interval_ms(Coop::CarStateIntervalMs)) return;
         g_last_send_ms = now;
         if (!g_car) g_car = find_car();
         if (g_car) send_state(g_car);

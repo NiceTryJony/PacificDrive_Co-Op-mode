@@ -1,4 +1,4 @@
-// Содержимое багажника машины (RECON.md «6.11», docs/DECISIONS.md). Host прав: Client видит то же, что у Host;
+// Содержимое багажника машины (RECON.md «6.11», docs/design/DECISIONS.md). Host прав: Client видит то же, что у Host;
 // что пассажир взял/положил, Client сообщает Host-у (TrunkTake/TrunkPut), Host меняет свой багажник или отказывает.
 #pragma once
 #include <cstdint>

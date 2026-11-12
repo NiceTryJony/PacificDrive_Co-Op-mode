@@ -50,7 +50,14 @@ namespace Items
         auto* effects = instance ? property<RawArray>(instance, STR("ActiveEffects")) : nullptr;
         if (!effects || !effects->Data) return out;
         for (int32_t i = 0; i < effects->Num; ++i)
-            if (auto* effect = effects->Data[i]) out.push_back(narrow(effect->GetClassPrivate()->GetPathName()));
+        {
+            auto* effect = effects->Data[i];
+            if (!effect) continue;
+            auto path = narrow(effect->GetClassPrivate()->GetPathName());
+            // «унаследованное сопротивление» от соседних деталей игра пересчитывает сама у каждого; синхронизация гоняла его по кругу:
+            // снятие одной детали давало запросы по 4–5 соседним слотам (тест 0.17.4 2026-11-07 21:55)
+            if (!path.ends_with("SE_InheritResist_C")) out.push_back(std::move(path));
+        }
         std::sort(out.begin(), out.end()); // повторы остаются: у одной детали бывает несколько одинаковых эффектов (парадокс из четырёх), чинятся по одному
         return out;
     }
@@ -106,6 +113,29 @@ namespace Items
         *p_context = context;
         fn.call();
         return *p_ret;
+    }
+
+    // Вызов функции игры, у которой первый параметр — выходной массив объектов (имя параметра в блюпринте неизвестно).
+    // false — функции нет или первый параметр не массив. Массив, выделенный игрой, не освобождаем: десятки байт на вызов
+    inline bool call_array(UObject* object, const TCHAR* name, std::vector<UObject*>& out)
+    {
+        auto* fn = object ? object->GetFunctionByNameInChain(name) : nullptr;
+        if (!fn) return false;
+        alignas(16) uint8_t params[512]{};
+        int32_t size = 0, offset = -1;
+        for (FProperty* p : TFieldRange<FProperty>(fn, EFieldIterationFlags::IncludeDeprecated))
+        {
+            // только массив объектов — иначе элементы нельзя читать как UObject*
+            if (auto* a = size == 0 ? CastField<FArrayProperty>(p) : nullptr; a && a->GetInner() && CastField<FObjectProperty>(a->GetInner()))
+                offset = p->GetOffset_ForInternal();
+            size = (std::max)(size, p->GetOffset_ForInternal() + p->GetSize());
+        }
+        if (offset < 0 || size > static_cast<int32_t>(sizeof(params))) return false;
+        object->ProcessEvent(fn, params);
+        auto* array = reinterpret_cast<RawArray*>(params + offset);
+        for (int32_t i = 0; array->Data && i < array->Num; ++i)
+            if (array->Data[i]) out.push_back(array->Data[i]);
+        return true;
     }
 
     // UItemSlot.AddItem; false — нет функции

@@ -1,5 +1,7 @@
-// Протокол Host ↔ Client (спека 3.2.3, ID — docs/SYNC_MAP.md). Общий для мода и tools/CoopProbe.
+// Протокол Host ↔ Client (спека 3.2.3, ID — docs/sync/SYNC_MAP.md). Используется модом (сетевой поток и игровой).
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -9,20 +11,27 @@
 namespace Coop
 {
     constexpr uint16_t DefaultPort = 47777;
-    constexpr size_t NumChannels = 3;
-    constexpr uint8_t ChannelReliable = 0;   // события (посадка, лут)
-    constexpr uint8_t ChannelUnreliable = 1; // частые состояния (CarState и т.п.)
-    constexpr uint8_t ChannelBulk = 2;       // файлы: свой reliable-канал, чтобы 3 МБ не задерживали события канала 0
+    // Версия протокола уходит в ENet connect(data): Host отклоняет несовпавшую. Менять при любом изменении формата пакетов
+    constexpr uint32_t ProtocolVersion = 4;
+    // Классы приоритета = каналы ENet (у каждого свой порядок доставки: застрявший пакет не держит остальные)
+    enum Priority : uint8_t
+    {
+        PrioCritical = 0,   // посадка/высадка, запрос сейва, ping — всегда первыми, reliable
+        PrioRealtime = 1,   // поза, машина — unreliable, в очереди только последнее значение
+        PrioEvent = 2,      // двери, детали, багажник, лут, якорь — reliable
+        PrioBackground = 3, // погода, радио, срез зоны, метки — reliable, после событий
+        PrioBulk = 4,       // сейвы: получают то, что осталось, окно в полёте ограничено
+        PrioCount = 5
+    };
+    constexpr size_t NumChannels = PrioCount;
     constexpr uint32_t ChunkSize = 64 * 1024; // файл режется на куски: прогресс в логе, основа для докачки
-    // Загрузка уровня на клиенте блокирует игровой поток ~10 с, а ENet обслуживается из тика — дефолтные 5–30 с мало
-    constexpr uint32_t PeerTimeoutMinMs = 60'000, PeerTimeoutMaxMs = 120'000;
 
     enum PacketId : uint8_t
     {
         CarState = 1,       // Host→Client: машина (CarStateBody), спека 3.2.2
         PassengerAttach = 3, // Host→Client: ответ на RequestSeat (SeatBody)
         PassengerDetach = 4, // Host→Client: ответ на RequestExitVehicle (SeatBody)
-        DoorState = 14,      // Host→Client: двери/капот/багажник машины изменились (DoorBody), docs/SYNC_MAP.md
+        DoorState = 14,      // Host→Client: двери/капот/багажник машины изменились (DoorBody), docs/sync/SYNC_MAP.md
         CarSystems = 15,     // Host→Client: зажигание, свет, топливо, аккумулятор (SystemsBody)
         CarPart = 16,        // Host→Client: что стоит в слоте машины (PartBody + тег и путь архетипа)
         TrunkItem = 17,      // Host→Client: сколько предметов одного типа в багажнике (TrunkItemBody + путь архетипа)
@@ -40,7 +49,7 @@ namespace Coop
         RequestExitVehicle = 22, // Client→Host: хочу выйти (SeatBody)
         InventoryAction = 23,    // Client→Host: я подобрал предмет из мира (LootBody), спека 3.2.2
         DoorRequest = 27,        // Client→Host: хочу открыть/закрыть дверь (DoorBody) — решает Host
-        PassengerPose = 25, // Client→Host: поза пассажира (PoseBody) — вместо ввода, docs/DECISIONS.md
+        PassengerPose = 25, // Client→Host: поза пассажира (PoseBody) — вместо ввода, docs/design/DECISIONS.md
         PassengerSave = 26,        // Client→Host: сейв кооп-слота с инвентарём пассажира; Host→Client: ответ на запрос (куски, как ZoneSave)
         PassengerSaveRequest = 28, // Client→Host: пришли мой сейв (Have=1); Host→Client: у меня его нет (Have=0)
         QuirkSet = 34,     // Host→Client: все причуды машины Host (QuirkSetBody), RECON.md 6.30
@@ -50,7 +59,30 @@ namespace Coop
         RadioTrack = 38,   // Host→Client: текущий трек радио (PartBody: вид file|stock + имя файла/Title), RECON.md 6.36
         QuirkKnow = 37,    // Client→Host: пассажир выяснил о причуде (QuirkKnowBody) — Host добавляет к своему знанию
         Ping = 40,    // Client→Host, Host отвечает тем же пакетом (эхо)
+        PortalActive = 41, // оба направления: портал выхода в этой точке активирован (AnchorBody) — активировать у себя
+        WeatherEvent = 42, // Host→Client (PartBody): тег "wev" + путь класса WEV_* (пусто — нет события) или тег "lvl" + 6 уровней погоды текстом
+        Mark = 44,         // оба: игрок нажал Ctrl+F7 «здесь что-то не так» (AnchorBody — где он стоит) — метка в лог собеседника
+        ZoneCensus = 45,   // оба: срез зоны (PartBody: тег — имя карты, значение — «Класс=число …») для сверки [ZoneDiff]
+        GateState = 46,    // оба: ворота выезда гаража (GSS_Garage_ExitGateOpened) сменились у отправителя (PartBody: тег "gate", значение "1" открыты / "0" закрыты)
+        HazardSpawn = 43,  // Host→Client: аномалия от взятия якоря (PartBody: тег "x y z pitch yaw roll" + путь класса) — создать там же
     };
+
+    inline Priority priority_of(PacketId id)
+    {
+        switch (id)
+        {
+        case PassengerAttach: case PassengerDetach: case RequestSeat: case RequestExitVehicle: case PassengerSaveRequest: case Ping:
+            return PrioCritical;
+        case CarState: case HostPose: case PassengerPose:
+            return PrioRealtime;
+        case WeatherEvent: case RadioTrack: case ZoneCensus: case Mark:
+            return PrioBackground;
+        case ZoneSave: case PassengerSave:
+            return PrioBulk;
+        default:
+            return PrioEvent;
+        }
+    }
 
 #pragma pack(push, 1)
     struct Header
@@ -80,6 +112,32 @@ namespace Coop
         float VX, VY, VZ;       // линейная скорость, см/с — для экстраполяции при потере пакетов
     };
     constexpr uint32_t CarStateIntervalMs = 33; // ~30 Гц, спека 3.2.2 (20–30 Гц)
+
+    // На проводе углы — int16 (360°/65536 ≈ 0,0055°), скорость — int16 по 2 см/с; позиция float (точность важнее). 36 → 24 байта
+    struct CarStateWire
+    {
+        float X, Y, Z;
+        int16_t Pitch, Yaw, Roll;
+        int16_t VX, VY, VZ;
+    };
+
+    inline int16_t pack_angle(float degrees)
+    {
+        float d = std::fmod(degrees, 360.0f);
+        return static_cast<int16_t>(static_cast<uint16_t>(static_cast<int32_t>(std::lround(d * (65536.0f / 360.0f)))));
+    }
+    inline float unpack_angle(int16_t v) { return v * (360.0f / 65536.0f); }
+    inline int16_t pack_speed(float v) { return static_cast<int16_t>(std::clamp(std::lround(v / 2), -32767l, 32767l)); }
+    inline float unpack_speed(int16_t v) { return v * 2.0f; }
+
+    inline CarStateWire to_wire(const CarStateBody& s)
+    {
+        return {s.X, s.Y, s.Z, pack_angle(s.Pitch), pack_angle(s.Yaw), pack_angle(s.Roll), pack_speed(s.VX), pack_speed(s.VY), pack_speed(s.VZ)};
+    }
+    inline CarStateBody from_wire(const CarStateWire& w)
+    {
+        return {w.X, w.Y, w.Z, unpack_angle(w.Pitch), unpack_angle(w.Yaw), unpack_angle(w.Roll), unpack_speed(w.VX), unpack_speed(w.VY), unpack_speed(w.VZ)};
+    }
 
     struct SeatBody
     {
@@ -157,7 +215,11 @@ namespace Coop
     // Знание о причуде только растёт — синхронизируем объединением (ИЛИ): что нашёл любой из двоих, видят оба
     constexpr uint8_t QuirkDiagnosed = 1,        // SE_Quirk_MixAndMatch_C.Diagnosed
         QuirkConditionPart = 2, QuirkConditionType = 4, // QuirkCondition.PartKnown / TypeKnown (BP_BaseQuirkElement_C)
-        QuirkBehaviorPart = 8, QuirkBehaviorType = 16;  // QuirkBehavior.PartKnown / TypeKnown
+        QuirkBehaviorPart = 8, QuirkBehaviorType = 16,  // QuirkBehavior.PartKnown / TypeKnown
+        // «решение найдено»: SE_Quirk_MixAndMatch_C.IsQuirkKnown(категория).FullyKnown, категории 0..2 — биты 32, 64, 128.
+        // Флаги выше панель решения не читает (тест 2026-11-10: Diagnosed дошёл, решения у второго игрока не видно)
+        QuirkFullyKnown0 = 32;
+    constexpr int QuirkCategories = 3; // EQuirkDetectiveRevealCategory
     struct QuirkKnowBody
     {
         uint32_t Key;
@@ -263,6 +325,62 @@ namespace Coop
         if (tail_size) std::memcpy(out.data() + sizeof(h) + sizeof(body), tail, tail_size);
         return out;
     }
+
+    // Кодек полезной нагрузки: запись/чтение с проверкой границ (новые пакеты вместо ручной упаковки структур с хвостом)
+    class Writer
+    {
+    public:
+        Writer& u8(uint8_t v) { return raw(&v, 1); }
+        Writer& u16(uint16_t v) { return raw(&v, 2); }
+        Writer& u32(uint32_t v) { return raw(&v, 4); }
+        Writer& f32(float v) { return raw(&v, 4); }
+        Writer& str(const std::string& v) // длина u16 + байты; длиннее 65535 обрезается
+        {
+            uint16_t n = static_cast<uint16_t>((std::min<size_t>)(v.size(), 65535));
+            u16(n);
+            return raw(v.data(), n);
+        }
+        const std::vector<uint8_t>& bytes() const { return m_buf; }
+
+    private:
+        Writer& raw(const void* p, size_t n)
+        {
+            auto* b = static_cast<const uint8_t*>(p);
+            m_buf.insert(m_buf.end(), b, b + n);
+            return *this;
+        }
+        std::vector<uint8_t> m_buf;
+    };
+
+    class Reader
+    {
+    public:
+        Reader(const uint8_t* data, size_t size) : m_data(data), m_size(size) {}
+        uint8_t u8() { uint8_t v = 0; raw(&v, 1); return v; }
+        uint16_t u16() { uint16_t v = 0; raw(&v, 2); return v; }
+        uint32_t u32() { uint32_t v = 0; raw(&v, 4); return v; }
+        float f32() { float v = 0; raw(&v, 4); return v; }
+        std::string str()
+        {
+            uint16_t n = u16();
+            if (!m_ok || m_size - m_pos < n) { m_ok = false; return {}; }
+            std::string v(reinterpret_cast<const char*>(m_data + m_pos), n);
+            m_pos += n;
+            return v;
+        }
+        bool ok() const { return m_ok; } // false — пакет короче, чем читали; прочитанное недействительно
+
+    private:
+        void raw(void* p, size_t n)
+        {
+            if (!m_ok || m_size - m_pos < n) { m_ok = false; return; }
+            std::memcpy(p, m_data + m_pos, n);
+            m_pos += n;
+        }
+        const uint8_t* m_data;
+        size_t m_size, m_pos = 0;
+        bool m_ok = true;
+    };
 
     // Тело пакета нужного типа или nullptr, если пакет короче
     template <typename Body>

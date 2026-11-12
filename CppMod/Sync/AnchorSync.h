@@ -8,6 +8,12 @@
 namespace AnchorSync
 {
     void tick(bool is_host);
+    void install(); // один раз при старте мода: перехват появления аномалий
+    void on_map_loading(); // перед LoadMap: аномалии, появляющиеся при загрузке, — из сейва, их не трогаем
     void on_map_loaded();
-    void on_anchor(const Coop::AnchorBody& body);
+    // AnchorTaken — якорь взят у собеседника; PortalActive — собеседник активировал портал выхода (тем же телом, по позиции)
+    void on_anchor(Coop::PacketId id, const Coop::AnchorBody& body);
+    // Аномалии от взятия якоря решает Host: появившиеся у него (BeginPlay) пересылает классом и местом (HazardSpawn),
+    // Client свои такие убирает сразу и создаёт присланные
+    void on_hazard(const std::string& where, const std::string& class_path);
 } // namespace AnchorSync

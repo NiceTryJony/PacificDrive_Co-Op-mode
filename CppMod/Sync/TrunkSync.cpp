@@ -7,12 +7,14 @@
 
 #include "Game/ItemProps.h"
 #include "Game/Items.h"
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Notify.h"
 #include "Networking/Net.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <format>
 #include <map>
@@ -45,6 +47,7 @@ namespace TrunkSync
             UObject* car = nullptr;
             UObject* component = nullptr; // BP_InventoryContainerComponent: AddItem сам выбирает ячейку
             UObject* container = nullptr;
+            bool named = false; // шкаф деталей: UNamedItemContainer (Slots — TMap), работаем через его функции
         };
 
         // Стопка: архетип + значения свойств. Ключ — строка, по которой стопки сравниваются и хранятся
@@ -82,22 +85,48 @@ namespace TrunkSync
 
         // Станция регенерации деталей в гараже — второй контейнер с теми же правилами: её стопки отличаются префиксом пути (пакеты те же)
         // Гоблер машины — третий: в нём лежат скормленные якоря (это и есть заряд kLIM; BP_InventoryManager_C.Inventory_Gobbler)
+        // Хранилища гаража (шкафы, ящики) — места StoragePlace + i, префикс «@S<i>:», i — номер контейнера в списке
+        // InventoryManager.GetGarageStationContainers. Порядок и размеры списка у Host и Client совпадают (тест 0.17.14, 2026-11-10)
         enum Place : int
         {
             TrunkPlace,
             IncubatorPlace,
             GobblerPlace,
-            PlaceCount
+            StoragePlace
         };
-        constexpr std::string_view PlacePrefix[PlaceCount] = {"", "@I:", "@G:"};
+        // Шкафы деталей гаража (BP_Garage_InventoryParts_C, контейнер — актёра NamedPartsContainer) — места LockerBase + j, префикс «@L<j>:»,
+        // j — номер шкафа по порядку (X, Y) позиции актёра: id и порядок массива игры между сессиями меняются (тест 2026-11-12)
+        constexpr int MaxStorages = 256;
+        constexpr int MaxLockers = 8;
+        constexpr int LockerBase = StoragePlace + MaxStorages;
+        constexpr std::string_view PlacePrefix[StoragePlace] = {"", "@I:", "@G:"};
+        std::string prefix_of(int place)
+        {
+            if (place < StoragePlace) return std::string(PlacePrefix[place]);
+            return place >= LockerBase ? std::format("@L{}:", place - LockerBase) : std::format("@S{}:", place - StoragePlace);
+        }
         int place_of(const std::string& path)
         {
-            for (int place = TrunkPlace + 1; place < PlaceCount; ++place)
+            if (path.starts_with("@S") || path.starts_with("@L"))
+            {
+                // номер из сети: не число или вне диапазона — считаем багажником, такой архетип просто не найдётся
+                const bool locker = path[1] == 'L';
+                const int limit = locker ? MaxLockers : MaxStorages;
+                int index = 0;
+                size_t i = 2;
+                for (; i < path.size() && path[i] >= '0' && path[i] <= '9' && index < limit; ++i) index = index * 10 + (path[i] - '0');
+                return i > 2 && i < path.size() && path[i] == ':' && index < limit ? (locker ? LockerBase : StoragePlace) + index : TrunkPlace;
+            }
+            for (int place = TrunkPlace + 1; place < StoragePlace; ++place)
                 if (path.starts_with(PlacePrefix[place])) return place;
             return TrunkPlace;
         }
         bool in_incubator(const std::string& path) { return place_of(path) == IncubatorPlace; }
-        std::string archetype_of(const std::string& path) { return path.substr(PlacePrefix[place_of(path)].size()); }
+        std::string archetype_of(const std::string& path)
+        {
+            int place = place_of(path);
+            return path.substr(place < StoragePlace ? PlacePrefix[place].size() : path.find(':') + 1);
+        }
 
         Key key_of(const Stack& stack)
         {
@@ -149,7 +178,7 @@ namespace TrunkSync
         // container == nullptr — нет машины или такая деталь не установлена
         Trunk find_car_container(const TCHAR* part_class, bool exact, const TCHAR* component_name)
         {
-            Trunk trunk{UObjectGlobals::FindFirstOf(STR("NewVehiclePawn"))}; // как CarSync
+            Trunk trunk{Cached::car()}; // как CarSync
             if (!trunk.car) return trunk;
             std::vector<UObject*> comps;
             UObjectGlobals::FindAllOf(STR("SlotSceneComponent"), comps);
@@ -203,7 +232,96 @@ namespace TrunkSync
             return incubator;
         }
 
-        Trunk find_place(int place) { return place == IncubatorPlace ? find_incubator() : place == GobblerPlace ? find_gobbler() : find_trunk(); }
+        std::vector<FWeakObjectPtr> g_storages; // хранилища гаража в порядке списка игры
+        bool g_storages_frozen = false;
+
+        // Список хранилищ фиксируем на карту, когда два опроса подряд дали одно число: станции появляются не сразу, а новая
+        // станция Host посреди сессии сдвинула бы номера (её контейнер начнёт синхронизироваться после смены карты).
+        // true — список только что зафиксирован
+        bool refresh_storages()
+        {
+            if (g_storages_frozen) return false;
+            static Cached::First manager{STR("BP_InventoryManager_C")};
+            std::vector<UObject*> list;
+            if (!Items::call_array(manager.get(), STR("GetGarageStationContainers"), list) || list.empty() || list.size() > MaxStorages) return false;
+            g_storages_frozen = list.size() == g_storages.size();
+            g_storages.clear();
+            for (auto* container : list) g_storages.emplace_back(container);
+            if (g_storages_frozen) Output::send<LogLevel::Verbose>(STR("[TrunkSync] хранилища гаража: контейнеров {}\n"), list.size());
+            return g_storages_frozen;
+        }
+
+        std::vector<FWeakObjectPtr> g_lockers; // контейнеры шкафов деталей в порядке (X, Y) актёров
+        bool g_lockers_frozen = false;
+
+        // Как refresh_storages: список фиксируем, когда два опроса подряд дали одно число шкафов. true — только что зафиксирован
+        // shortcut: FindAllOf по классу каждый опрос, пока шкафов нет (не в гараже) — добавить паузу между поисками, если станет заметно
+        bool refresh_lockers()
+        {
+            if (g_lockers_frozen) return false;
+            std::vector<UObject*> actors;
+            UObjectGlobals::FindAllOf(STR("BP_Garage_InventoryParts_C"), actors);
+            struct Vec
+            {
+                float X, Y, Z;
+            };
+            std::vector<std::pair<std::pair<int, int>, UObject*>> found;
+            for (auto* actor : actors)
+            {
+                auto** container = property<UObject*>(actor, STR("NamedPartsContainer"));
+                UFunctionCall loc(actor, STR("K2_GetActorLocation"));
+                auto* ret = loc ? loc.param<Vec>(STR("ReturnValue")) : nullptr;
+                if (!container || !*container || !ret) continue;
+                loc.call();
+                found.push_back({{static_cast<int>(std::lround(ret->X)), static_cast<int>(std::lround(ret->Y))}, *container});
+            }
+            if (found.empty() || found.size() > MaxLockers) return false;
+            std::sort(found.begin(), found.end(), [](auto& a, auto& b) { return a.first < b.first; });
+            g_lockers_frozen = found.size() == g_lockers.size();
+            g_lockers.clear();
+            for (auto& [pos, container] : found) g_lockers.emplace_back(container);
+            if (g_lockers_frozen) Output::send<LogLevel::Verbose>(STR("[TrunkSync] шкафы деталей: {}\n"), found.size());
+            return g_lockers_frozen;
+        }
+
+        // Все места: багажник, станция, гоблер, дальше хранилища гаража по номерам, с LockerBase — шкафы деталей
+        // (container == nullptr — места сейчас нет)
+        std::vector<Trunk> find_places()
+        {
+            std::vector<Trunk> places{find_trunk(), find_incubator(), find_gobbler()};
+            UObject* context = Cached::car(); // контекст мира для создания предметов
+            if (!context) context = places[IncubatorPlace].car;
+            if (g_storages_frozen)
+                for (auto& weak : g_storages)
+                {
+                    UObject* container = weak.Get();
+                    // контейнер станции регенерации игра отдаёт и в этом списке — у него уже есть своё место; номера остальных не сдвигаем
+                    bool own = std::any_of(places.begin(), places.begin() + StoragePlace, [&](const Trunk& t) { return t.container == container; });
+                    places.push_back(Trunk{context, nullptr, own || !context ? nullptr : container});
+                }
+            if (g_lockers_frozen)
+            {
+                places.resize(LockerBase);
+                for (auto& weak : g_lockers) places.push_back(Trunk{context, nullptr, context ? weak.Get() : nullptr, true});
+            }
+            return places;
+        }
+
+        // Шкаф: предметы функцией игры (Slots — TMap, raw-чтение роняло игру в 0.17.12/13)
+        std::vector<UObject*> named_items(UObject* container)
+        {
+            std::vector<UObject*> list;
+            Items::call_array(container, STR("GetAllItems"), list);
+            return list;
+        }
+
+        int item_count(UObject* container)
+        {
+            int total = 0;
+            auto* slots = property<Items::RawArray>(container, STR("Slots"));
+            for (int32_t i = 0; slots && slots->Data && i < slots->Num; ++i) total += Items::items_of(slots->Data[i]).Num;
+            return total;
+        }
 
         // Игрок тащит предмет мышью: он во временной ячейке курсора, из багажника «пропал». UContainerCursor.GrabbedSlot
         // ставит GrabSlot и обнуляет PlacedGrabbed (exe+0x11aadc0, RECON.md «6.12») — пока не пусто, багажник не сравниваем
@@ -220,20 +338,43 @@ namespace TrunkSync
         ByKey read_items(UObject* container, int place = TrunkPlace)
         {
             ByKey by_key;
+            const std::string prefix = prefix_of(place);
+            if (place >= LockerBase)
+            {
+                for (auto* item : named_items(container))
+                {
+                    Stack stack{Items::archetype_path(item), values_of(item)};
+                    if (stack.Path.empty()) continue;
+                    stack.Path.insert(0, prefix);
+                    auto& entry = by_key[key_of(stack)];
+                    if (entry.Items.empty()) entry.Stack = std::move(stack);
+                    entry.Items.push_back(item);
+                }
+                return by_key;
+            }
             auto* slots = property<Items::RawArray>(container, STR("Slots"));
             if (!slots || !slots->Data) return by_key;
             for (int32_t i = 0; i < slots->Num; ++i)
             {
                 auto items = Items::items_of(slots->Data[i]);
+                Entry* slot_entry = nullptr;
                 for (int32_t k = 0; k < items.Num; ++k)
                 {
                     if (!items.Data[k]) continue;
+                    // shortcut: в хранилище гаража (тысячи предметов) стопку ячейки задаёт её первый предмет — в одной ячейке лежат
+                    // одинаковые; читать каждый, если найдутся ячейки с разными значениями свойств
+                    if (place >= StoragePlace && slot_entry)
+                    {
+                        slot_entry->Items.push_back(items.Data[k]);
+                        continue;
+                    }
                     Stack stack{Items::archetype_path(items.Data[k]), values_of(items.Data[k])};
                     if (stack.Path.empty()) continue;
-                    stack.Path.insert(0, PlacePrefix[place]);
+                    stack.Path.insert(0, prefix);
                     auto& entry = by_key[key_of(stack)];
                     if (entry.Items.empty()) entry.Stack = std::move(stack);
                     entry.Items.push_back(items.Data[k]);
+                    slot_entry = &entry;
                 }
             }
             return by_key;
@@ -247,9 +388,62 @@ namespace TrunkSync
         }
 
         // Предмет в багажник через его компонент; false — игра не приняла (созданный предмет удаляем, чтобы не висел)
-        bool add_to_trunk(UObject* component, UObject* instance)
+        bool add_to_trunk(const Trunk& trunk, UObject* instance)
         {
-            UFunctionCall add(component, STR("AddItem"));
+            if (trunk.named)
+            {
+                // Шкаф деталей: AddItem(Slot, Item, CreateSlot) в первую пустую ячейку (в какую именно — не важно, синхронизируем стопки)
+                int before = static_cast<int>(named_items(trunk.container).size());
+                UFunctionCall names(trunk.container, STR("GetSlotNames"));
+                auto* p_names = names ? names.param<Items::RawArray>(STR("SlotNames")) : nullptr;
+                UFunctionCall add(trunk.container, STR("AddItem"));
+                auto* p_slot = add ? add.param<FName>(STR("Slot")) : nullptr;
+                auto* p_item = add ? add.param<UObject*>(STR("Item")) : nullptr;
+                auto* p_create = add ? add.param<bool>(STR("CreateSlot")) : nullptr;
+                bool placed = false;
+                if (p_names && p_slot && p_item && p_create)
+                {
+                    names.call();
+                    auto* data = reinterpret_cast<FName*>(p_names->Data);
+                    for (int32_t i = 0; data && i < p_names->Num && !placed; ++i)
+                    {
+                        UFunctionCall get(trunk.container, STR("GetSlot"));
+                        auto* g_name = get ? get.param<FName>(STR("Slot")) : nullptr;
+                        auto* g_ret = get ? get.param<UObject*>(STR("ReturnValue")) : nullptr;
+                        if (!g_name || !g_ret) break;
+                        *g_name = data[i];
+                        get.call();
+                        if (!*g_ret || Items::items_of(*g_ret).Num > 0) continue; // занята
+                        *p_slot = data[i];
+                        *p_item = instance;
+                        *p_create = true;
+                        add.call();
+                        placed = static_cast<int>(named_items(trunk.container).size()) > before;
+                        break;
+                    }
+                }
+                if (!placed) Items::remove(instance);
+                return placed;
+            }
+            if (!trunk.component)
+            {
+                // Хранилище гаража: компонента нет, кладём в сам UItemContainer (AddItem(Item, CreateSlotIfFull); шкаф растёт сам:
+                // 145 → 148 ячеек в тесте 0.17.14). Тип результата в дампе не виден — успех проверяем по числу предметов
+                UFunctionCall add(trunk.container, STR("AddItem"));
+                auto* p_item = add ? add.param<UObject*>(STR("Item")) : nullptr;
+                auto* p_create = add ? add.param<bool>(STR("CreateSlotIfFull")) : nullptr;
+                int before = item_count(trunk.container);
+                if (p_item && p_create)
+                {
+                    *p_item = instance;
+                    *p_create = true;
+                    add.call();
+                }
+                bool added = item_count(trunk.container) > before;
+                if (!added) Items::remove(instance);
+                return added;
+            }
+            UFunctionCall add(trunk.component, STR("AddItem"));
             auto* p_item = add ? add.param<UObject*>(STR("Item")) : nullptr;
             auto* p_added = add ? add.param<bool>(STR("Added")) : nullptr;
             if (!p_item || !p_added) return false;
@@ -275,7 +469,7 @@ namespace TrunkSync
             for (size_t i = 0; i < n; ++i)
             {
                 auto* instance = Items::create(trunk.car, archetype_of(stack.Path), context);
-                if (!instance || !add_to_trunk(trunk.component, instance))
+                if (!instance || !add_to_trunk(trunk, instance))
                 {
                     Output::send<LogLevel::Warning>(STR("[TrunkSync] {}: не положить в багажник ({} из {}) — {}\n"), Items::wide(stack.Path), i, n,
                                                     instance ? STR("игра не приняла") : STR("не создать предмет"));
@@ -308,7 +502,10 @@ namespace TrunkSync
         std::wstring describe(const Stack& stack)
         {
             auto name = Items::wide(stack.Path.substr(stack.Path.rfind('.') + 1));
-            if (int place = place_of(stack.Path); place != TrunkPlace) name.insert(0, place == IncubatorPlace ? STR("[станция] ") : STR("[гоблер] ")); // в логе видно, где лежит
+            // в логе видно, где лежит
+            if (int place = place_of(stack.Path); place >= LockerBase) name.insert(0, std::format(STR("[шкаф {}] "), place - LockerBase));
+            else if (place >= StoragePlace) name.insert(0, std::format(STR("[хранилище {}] "), place - StoragePlace));
+            else if (place != TrunkPlace) name.insert(0, place == IncubatorPlace ? STR("[станция] ") : STR("[гоблер] "));
             for (auto& v : stack.Values) name += Items::wide(" " + text_of(v));
             return name;
         }
@@ -342,7 +539,8 @@ namespace TrunkSync
         void on_request(Coop::PacketId id, uint16_t count, const Stack& stack)
         {
             int place = place_of(stack.Path);
-            auto trunk = find_place(place);
+            auto places = find_places();
+            auto trunk = place < static_cast<int>(places.size()) ? places[place] : Trunk{};
             if (!trunk.container)
             {
                 // нет багажника (станции) — «взял» отклоняем целиком (у пассажира не должно появиться ничего), «положил» теряется
@@ -387,7 +585,7 @@ namespace TrunkSync
                 }
                 taken.pop_back();
             }
-            Notify::push(Notify::Kind::Warn, "The driver already took that from the trunk");
+            Notify::push(Notify::Kind::Warn, place_of(stack.Path) >= StoragePlace ? "The driver already took that from storage" : "The driver already took that from the trunk");
             Output::send<LogLevel::Warning>(STR("[TrunkSync] Host уже забрал {} × {} — убрано у пассажира {}\n"), describe(stack), count, removed);
         }
 
@@ -460,6 +658,10 @@ namespace TrunkSync
         g_baseline = false;
         g_prev.clear();
         g_taken.clear();
+        g_storages.clear();
+        g_storages_frozen = false;
+        g_lockers.clear();
+        g_lockers_frozen = false;
     }
 
     void tick(bool is_host)
@@ -469,13 +671,21 @@ namespace TrunkSync
         if (now - g_last_poll_ms < PollMs || now - g_map_loaded_ms < SettleMs) return;
         g_last_poll_ms = now;
         if (dragging()) return; // и Host не шлёт «−1», и Client не принимает перетаскивание за «взял»
-        Trunk places[PlaceCount] = {find_trunk(), find_incubator(), find_gobbler()};
-        for (int place = TrunkPlace; place < PlaceCount; ++place)
+        bool lockers_fresh = refresh_lockers(); // оба обновляем всегда (не через ||)
+        if (refresh_storages() || lockers_fresh)
+        {
+            // Хранилища появились позже остальных мест: Host шлёт всё заново, Client добирает опору (иначе их содержимое
+            // он принял бы за «пассажир положил» и задвоил у Host)
+            g_send_full = true;
+            g_baseline = false;
+        }
+        auto places = find_places();
+        for (int place = TrunkPlace; place < StoragePlace; ++place)
         {
             int8_t found = places[place].container != nullptr;
             if (found == g_seen[place]) continue;
             g_seen[place] = found;
-            static const TCHAR* names[PlaceCount] = {STR("багажник"), STR("станция регенерации"), STR("гоблер")};
+            static const TCHAR* names[StoragePlace] = {STR("багажник"), STR("станция регенерации"), STR("гоблер")};
             auto* slots = found ? property<Items::RawArray>(places[place].container, STR("Slots")) : nullptr;
             Output::send<LogLevel::Verbose>(STR("[TrunkSync] {}: {}{}\n"), names[place], found ? STR("контейнер найден, ячеек ") : STR("контейнера нет (не в гараже / не установлена)"), found && slots ? std::to_wstring(slots->Num) : std::wstring{});
         }
@@ -483,12 +693,15 @@ namespace TrunkSync
         // Все контейнеры в одной карте: ключи станции и гоблера начинаются с префикса, с багажником не пересекаются
         auto read_all = [&] {
             ByKey all;
-            for (int place = TrunkPlace; place < PlaceCount; ++place)
+            for (int place = TrunkPlace; place < static_cast<int>(places.size()); ++place)
                 if (places[place].container)
                     for (auto& [key, entry] : read_items(places[place].container, place)) all.emplace(key, std::move(entry));
             return all;
         };
-        auto place_present = [&](const Key& key) { return places[place_of(key)].container != nullptr; };
+        auto place_present = [&](const Key& key) {
+            int place = place_of(key);
+            return place < static_cast<int>(places.size()) && places[place].container != nullptr;
+        };
         auto items = read_all();
 
         if (is_host)
@@ -555,23 +768,28 @@ namespace TrunkSync
     // Ctrl+F6 (Diag): что лежит в багажнике, станции и гоблере — число предметов и стопок
     void describe()
     {
-        static const TCHAR* names[PlaceCount] = {STR("багажник"), STR("станция"), STR("гоблер")};
-        for (int place = 0; place < PlaceCount; ++place)
+        static const TCHAR* names[StoragePlace] = {STR("багажник"), STR("станция"), STR("гоблер")};
+        auto places = find_places();
+        for (int place = 0; place < static_cast<int>(places.size()); ++place)
         {
-            auto trunk = find_place(place);
+            auto& trunk = places[place];
+            auto name = place < StoragePlace ? std::wstring(names[place]) : place >= LockerBase ? std::format(STR("шкаф {}"), place - LockerBase) : std::format(STR("хранилище {}"), place - StoragePlace);
             if (!trunk.container)
             {
-                Output::send<LogLevel::Verbose>(STR("[Diag] {}: контейнера нет\n"), names[place]);
+                if (place < StoragePlace) Output::send<LogLevel::Verbose>(STR("[Diag] {}: контейнера нет\n"), name);
                 continue;
             }
             int total = 0;
             std::string list;
-            for (auto& [key, entry] : read_items(trunk.container, place))
+            auto items = read_items(trunk.container, place);
+            for (auto& [key, entry] : items)
             {
                 total += static_cast<int>(entry.Items.size());
                 list += std::format(" {}×{}", entry.Items.size(), entry.Stack.Path.substr(entry.Stack.Path.rfind('/') + 1));
             }
-            Output::send<LogLevel::Verbose>(STR("[Diag] {}: предметов {};{}\n"), names[place], total, Items::wide(list));
+            if (place < StoragePlace) Output::send<LogLevel::Verbose>(STR("[Diag] {}: предметов {};{}\n"), name, total, Items::wide(list));
+            else if (place >= LockerBase) Output::send<LogLevel::Verbose>(STR("[Diag] {}: предметов {};{}\n"), name, total, Items::wide(list));
+            else if (total) Output::send<LogLevel::Verbose>(STR("[Diag] {}: предметов {}, стопок {}\n"), name, total, items.size()); // список длинный — только числа
         }
     }
 } // namespace TrunkSync

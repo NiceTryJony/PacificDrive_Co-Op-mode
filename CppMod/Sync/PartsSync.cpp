@@ -5,6 +5,7 @@
 
 #include "Game/ItemProps.h"
 #include "Game/Items.h"
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 
@@ -29,6 +30,8 @@ namespace PartsSync
     namespace
     {
         constexpr uint64_t PollMs = 300; // цепочка Client → Host → Client = опросы × дребезг (2 опроса) + сеть; при 1000 была ~4 с
+        constexpr uint64_t FastPollMs = 60; // пока применяем присланное
+        uint64_t g_last_full_ms = 0;
         constexpr uint64_t SettleMs = 5000; // после загрузки карты слоты ещё заполняются — пустые не рассылать и не применять
         constexpr int MaxApplyAttempts = 3;
         // Внутренние слоты (хранилище, крафт, «душа», гоблер) не трогаем: там инвентарь и прогресс, ошибка стоит дорого
@@ -246,7 +249,7 @@ namespace PartsSync
         std::set<std::string> g_levels_seen;                   // Client: «больше, чем у Host» замечено прошлым опросом
         std::map<std::string, std::string> g_levels_reported;  // Client: какие уровни уже отправлены Host-у
 
-        // Здоровье деталей (docs/SYNC_PLAN.md, правило 3). Host шлёт при смене слота и при изменении ≥ health_step; Client подтягивается
+        // Здоровье деталей (docs/sync/SYNC_PLAN.md, правило 3). Host шлёт при смене слота и при изменении ≥ health_step; Client подтягивается
         // к Host-у, а если у него стало больше (Repair Putty, установка починенной детали) — просит Host. Урон Client не получает:
         // физика куклы выключена, поэтому «больше» = действие игрока
         struct HealthWant
@@ -313,7 +316,7 @@ namespace PartsSync
             return true;
         }
 
-        UObject* find_car() { return UObjectGlobals::FindFirstOf(STR("NewVehiclePawn")); } // как CarSync
+        UObject* find_car() { return Cached::car(); } // как CarSync
 
         // Слоты машины по тегу. Теги, встречающиеся дважды (у машины есть такие), пропускаем: порядок компонентов у Host
         // и Client может разниться, и слот попал бы не в тот
@@ -656,8 +659,14 @@ namespace PartsSync
     {
         if (!Net::connected()) return;
         uint64_t now = now_ms();
-        if (now - g_last_poll_ms < PollMs || now - g_map_loaded_ms < SettleMs) return;
+        // Пока есть что применить (запрос Client-а у Host, слово Host-а у Client), опрашиваем чаще: применение и рассылка итога
+        // не ждут обычного опроса (тест 0.17.5: действие с деталью доходило ~1 с). Опрос стоит до 5 мс — постоянно чаще не надо
+        uint64_t interval = g_wanted.empty() ? PollMs : FastPollMs;
+        if (now - g_last_poll_ms < interval || now - g_map_loaded_ms < SettleMs) return;
         g_last_poll_ms = now;
+        // Применение (apply пересоздаёт деталь, здоровье/краска/уровни считают попытки) — не чаще прежнего; быстрый опрос только замечает итог
+        bool full = now - g_last_full_ms >= PollMs;
+        if (full) g_last_full_ms = now;
         auto* car = find_car();
         if (!car) return;
         auto slots = read_slots(car);
@@ -671,6 +680,12 @@ namespace PartsSync
             {
                 g_attempts.erase(it->first);
                 it = g_wanted.erase(it);
+                continue;
+            }
+            // первая попытка — сразу; повтор — только на полном опросе (игре нужно время поставить деталь)
+            if (g_attempts.contains(it->first) && !full)
+            {
+                ++it;
                 continue;
             }
             if (++g_attempts[it->first] > MaxApplyAttempts)
@@ -689,9 +704,12 @@ namespace PartsSync
             apply(car, it->first, slot->second, it->second, context);
             ++it; // совпадение проверит следующий опрос
         }
-        apply_health(slots);
-        apply_tint(slots, is_host);
-        apply_levels(slots, is_host);
+        if (full)
+        {
+            apply_health(slots);
+            apply_tint(slots, is_host);
+            apply_levels(slots, is_host);
+        }
 
         if (is_host)
         {
@@ -702,10 +720,26 @@ namespace PartsSync
             }
             g_send_full = false;
             int sent = 0;
-            for (auto& [tag, slot] : slots)
+            for (auto& [tag, real] : slots)
             {
+                // Деталь по запросу Client только что создана: краска первое время дефолтная, а Client уже покрашен как надо —
+                // шлём ту, что сейчас наносим, иначе у Client мигает дефолтной (тест 0.17.5)
+                Slot slot = real;
+                if (auto w = g_tint_wanted.find(tag); w != g_tint_wanted.end() && !slot.tint.empty() && w->second.archetype == archetype_of(slot.path))
+                    slot.tint = w->second.tint;
                 auto it = g_sent.find(tag);
                 bool path_changed = it == g_sent.end() || it->second != slot.path;
+                // Новая деталь на Host читается с дефолтной краской на первом опросе: шлём только когда два опроса подряд дали одно и то же
+                // (если краску навязал Client через g_tint_wanted — она уже верная, ждать не нужно)
+                if (path_changed && it != g_sent.end() && !slot.tint.empty() && slot.tint == real.tint)
+                {
+                    auto seen = g_tint_seen.find(tag);
+                    if (seen == g_tint_seen.end() || seen->second != slot.tint)
+                    {
+                        g_tint_seen[tag] = slot.tint;
+                        continue;
+                    }
+                }
                 float health = to_float(slot.health);
                 auto sent_health = g_sent_health.find(tag);
                 bool health_changed = !std::isnan(health) && (sent_health == g_sent_health.end() || std::fabs(health - sent_health->second) >= health_step(sent_health->second));
@@ -765,7 +799,8 @@ namespace PartsSync
                 continue;
             }
             auto seen = g_seen.find(tag);
-            if (seen == g_seen.end() || seen->second != slot.path) // при замене деталь на миг исчезает — ждём второго опроса
+            // при замене деталь на миг исчезает — пустой слот подтверждаем вторым опросом; поставленную деталь шлём сразу
+            if (slot.path.empty() && (seen == g_seen.end() || seen->second != slot.path))
             {
                 g_seen[tag] = slot.path;
                 continue;
@@ -776,6 +811,9 @@ namespace PartsSync
             g_reported[tag] = slot.path;
             Output::send<LogLevel::Verbose>(STR("[PartsSync] {}: деталь изменена игроком → прошу Host: {}\n"), wide(tag), slot.path.empty() ? STR("(пусто)") : wide(slot.path));
         }
+
+        // Дальше подтверждение «вторым опросом» (краска при смене детали на миг дефолтная и т.п.) — только на обычном интервале
+        if (!full) return;
 
         // Client: здоровье той же детали разошлось с Host-ом
         for (auto& [tag, slot] : slots)

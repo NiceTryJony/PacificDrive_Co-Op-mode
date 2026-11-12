@@ -3,6 +3,7 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 
@@ -19,7 +20,7 @@ using namespace RC::Unreal;
 
 // Марионетка — SkeletalMeshActor с мешем нашего же персонажа (меш гарантированно загружен), без коллизии.
 // Анимация — циклы стойка/ходьба/бег того же скелета (уже в памяти: ими пользуется наш персонаж), выбор по скорости.
-// Не настоящий Character: GameMode/PlayerController одиночной игры второй pawn не ждут (docs/DECISIONS.md).
+// Не настоящий Character: GameMode/PlayerController одиночной игры второй pawn не ждут (docs/design/DECISIONS.md).
 namespace Presence
 {
     namespace
@@ -72,7 +73,7 @@ namespace Presence
             return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
         }
 
-        UObject* own_character() { return UObjectGlobals::FindFirstOf(STR("BaseCharacter")); }
+        UObject* own_character() { return Cached::character(); }
 
         void send_own_pose(UObject* character)
         {
@@ -301,7 +302,7 @@ namespace Presence
         if (!character) return; // меню, загрузка
 
         uint64_t now = now_ms();
-        if (now - g_last_send_ms >= Coop::PoseIntervalMs)
+        if (now - g_last_send_ms >= Net::adaptive_interval_ms(Coop::PoseIntervalMs))
         {
             g_last_send_ms = now;
             send_own_pose(character);
