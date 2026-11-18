@@ -20,13 +20,31 @@ camera_follow=1
 status_overlay=1
 ; Детали машины: 1 — пассажир ставит/снимает их, Host принимает; 0 — запрет (у пассажира правка откатывается)
 client_parts=1
+; Client, сидя в машине, управляет ею: шлёт Host-у газ и руль (0 — выключено; у Host значения игнорируются, если Client не шлёт)
+client_drive=0
+; Предмет в руке собеседника: 1 — показывать его работу (насадки, пламя, плазма, вращение); 0 — только модель
+hand_fx=1
 ; Высадка (Ctrl+E): на сколько см от оси машины в сторону, с которой сидели (0 — штатная точка игры, ставит на крышу)
 exit_side_cm=230
-; HUD (Lua, читает только при старте игры): hud=0 — выключить; hud_panel=0 — без плашки статуса
-; hud_corner: tl|tr|bl|br; hud_text — размер текста в процентах (60..200); hud_toast_sec — сколько висит уведомление; hud_fade=0 — не приглушать плашку
+; HUD (Lua, применяется сразу при изменении файла; docs/design/HUD_PLAN.md): hud=0 — выключить
+; hud_mode: lamp|compact|standard|detailed — размер при старте (в игре — клавиша hud_key: h|j|k|none, с Ctrl)
+; hud_corner: tl|tr|bl|br; hud_text — размер в процентах (60..160); hud_bg — тёмность плашки (30..100); hud_fade=0 — не приглушать
+; hud_notices: all|problems|off; hud_doors=1 — уведомления о дверях; hud_toast_sec (2..12); hud_toast_max (1..3)
+; hud_mate=0 — без стрелки и расстояния; hud_banner=0 — без баннера «напарник ушёл»; hud_motion: full|reduced|off
 hud=1
-hud_panel=1
-hud_corner=tl
+hud_mode=compact
+hud_key=h
+hud_corner=tr
 hud_text=100
-hud_toast_sec=4
+hud_bg=76
 hud_fade=1
+hud_notices=all
+hud_doors=0
+hud_toast_sec=4
+hud_toast_max=3
+hud_mate=1
+; метка над напарником: полностью видна до hud_mate_fade_start м, к hud_mate_fade_end м гаснет совсем
+hud_mate_fade_start=50
+hud_mate_fade_end=75
+hud_banner=1
+hud_motion=full

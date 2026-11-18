@@ -4,6 +4,7 @@
 #include <Unreal/UClass.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
+#include "Game/Cached.h"
 #include "Game/Items.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
@@ -31,7 +32,7 @@ namespace QuirkSync
         std::map<uint32_t, int> g_mine;                // Client: свой набор на прошлом опросе
         std::map<uint32_t, std::string> g_names;       // ключ → "QC|QB" для лога
 
-        UObject* manager() { return UObjectGlobals::FindFirstOf(STR("BP_StatusEffectManager_C")); }
+        UObject* manager() { static Cached::First f{STR("BP_StatusEffectManager_C")}; return f.get(); }
 
         std::string class_of(UObject* quirk, const TCHAR* prop)
         {

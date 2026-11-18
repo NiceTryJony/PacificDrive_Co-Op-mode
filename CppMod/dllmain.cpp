@@ -9,6 +9,7 @@
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/Hooks/Hooks.hpp>
 
+#include "Game/Cached.h"
 #include "Game/ItemProps.h"
 #include "Game/ObjectDump.h"
 #include "Game/SaveInventory.h"
@@ -29,10 +30,14 @@
 #include "Sync/QuirkSync.h"
 #include "Sync/AnchorSync.h"
 #include "Sync/RadioSync.h"
+#include "Sync/Guard.h"
 #include "Sync/HeapGuard.h"
+#include "Sync/HudFeed.h"
+#include "Sync/DriveProbe.h"
 #include "Sync/GateSync.h"
 #include "Sync/WeatherSync.h"
 #include "Sync/WorldItemSync.h"
+#include "Sync/LeechSync.h"
 #include "Sync/LootSync.h"
 #include "Sync/PassengerSync.h"
 #include "Sync/Presence.h"
@@ -86,6 +91,48 @@ namespace ZoneSave
         return std::filesystem::path(local ? local : L"") / std::format(L"PenDriverPro/Saved/SaveGames/odsave{}.sav", slot);
     }
 
+    // Запись через временный файл и rename: вылет посреди записи не оставит битый файл (слот игры, zone.sav)
+    bool write_atomic(const std::filesystem::path& path, const uint8_t* data, size_t size)
+    {
+        auto tmp = path;
+        tmp += L".tmp";
+        std::error_code ec;
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+            out.flush();
+            if (!out) { out.close(); std::filesystem::remove(tmp, ec); return false; }
+        }
+        std::filesystem::rename(tmp, path, ec); // на Windows заменяет существующий файл
+        if (ec) std::filesystem::remove(tmp, ec);
+        return !ec;
+    }
+
+    // Файл целиком одним read: istreambuf_iterator по байту на ~10 МБ сейве заметно тормозит игровой поток
+    std::vector<uint8_t> read_all(const std::filesystem::path& path)
+    {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f) return {};
+        auto size = static_cast<std::streamoff>(f.tellg());
+        if (size <= 0) return {};
+        std::vector<uint8_t> data(static_cast<size_t>(size));
+        f.seekg(0);
+        f.read(reinterpret_cast<char*>(data.data()), size);
+        if (!f) data.clear();
+        return data;
+    }
+
+    bool copy_atomic(const std::filesystem::path& from, const std::filesystem::path& to)
+    {
+        auto tmp = to;
+        tmp += L".tmp";
+        std::error_code ec;
+        if (!std::filesystem::copy_file(from, tmp, std::filesystem::copy_options::overwrite_existing, ec) || ec) return false;
+        std::filesystem::rename(tmp, to, ec);
+        if (ec) std::filesystem::remove(tmp, ec);
+        return !ec;
+    }
+
     void save()
     {
         auto* mgr = manager();
@@ -131,13 +178,13 @@ namespace ZoneSave
         if (ec) return;
         // Копия в папку мода — для ручного F11 на этом же ПК и для отладки
         std::filesystem::create_directories(CoopDir, ec);
-        std::filesystem::copy_file(path, ZoneFile, std::filesystem::copy_options::overwrite_existing, ec);
-        Output::send<LogLevel::Verbose>(STR("[ZoneSave] копия: {}{}\n"), ZoneFile.wstring(), ec ? STR(" — ОШИБКА КОПИРОВАНИЯ") : STR(""));
+        bool copied = copy_atomic(path, ZoneFile);
+        Output::send<LogLevel::Verbose>(STR("[ZoneSave] копия: {}{}\n"), ZoneFile.wstring(), copied ? STR("") : STR(" — ОШИБКА КОПИРОВАНИЯ"));
         Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: сейв зоны записан, отправляю\n"), since_connect());
+        StatusFile::mark_world_saved();
         if (Net::connected())
         {
-            std::ifstream f(path, std::ios::binary);
-            Net::send_zone_save(std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {}), g_net_events);
+            Net::send_zone_save(read_all(path), g_net_events);
         }
     }
 } // namespace ZoneSave
@@ -194,11 +241,7 @@ namespace ZoneLoad
         return 0;
     }
 
-    std::vector<uint8_t> read_file(const std::filesystem::path& path)
-    {
-        std::ifstream f(path, std::ios::binary);
-        return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
-    }
+    std::vector<uint8_t> read_file(const std::filesystem::path& path) { return ZoneSave::read_all(path); }
 
     std::wstring from_utf8(const std::string& s) { return std::filesystem::path(std::u8string(s.begin(), s.end())).wstring(); }
 
@@ -260,12 +303,8 @@ namespace ZoneLoad
             *d_backups = true;
             delete_slot.call();
         }
-        std::error_code ec;
-        if (!merged.empty())
-            std::ofstream(ZoneSave::slot_path(slot), std::ios::binary).write(reinterpret_cast<const char*>(merged.data()), static_cast<std::streamsize>(merged.size()));
-        else
-            std::filesystem::copy_file(ZoneSave::ZoneFile, ZoneSave::slot_path(slot), std::filesystem::copy_options::overwrite_existing, ec);
-        if (ec || !std::filesystem::exists(ZoneSave::slot_path(slot)))
+        bool written = !merged.empty() ? ZoneSave::write_atomic(ZoneSave::slot_path(slot), merged.data(), merged.size()) : ZoneSave::copy_atomic(ZoneSave::ZoneFile, ZoneSave::slot_path(slot));
+        if (!written || !std::filesystem::exists(ZoneSave::slot_path(slot)))
         {
             Output::send<LogLevel::Error>(STR("[ZoneLoad] не удалось скопировать {} в слот {} (нет файла? сначала F10)\n"), ZoneSave::ZoneFile.wstring(), slot);
             return;
@@ -397,12 +436,14 @@ namespace LiveConfig
         auto t = std::filesystem::last_write_time(path, ec);
         if (ec || t == seen) return;
         seen = t;
+        HudFeed::config_changed();
         auto c = Net::load_config(path);
         g_net_config.status_overlay = c.status_overlay;
         g_net_config.restrict_interactions = c.restrict_interactions;
         g_net_config.camera_follow = c.camera_follow;
         g_net_config.exit_side_cm = c.exit_side_cm;
         g_net_config.client_parts = c.client_parts;
+        g_net_config.hand_fx = c.hand_fx; // Presence::tick сам пересоберёт предмет у куклы
         PassengerSync::set_restrict_interactions(c.restrict_interactions);
         PassengerSync::set_camera_follow(c.camera_follow);
         PassengerSync::set_exit_side_cm(c.exit_side_cm);
@@ -439,12 +480,37 @@ namespace Overlay
         if (!g_ready_at_ms) return L"game is starting...";
         if (!Net::connected()) g_world_synced = false;
         uint64_t since = ZoneLoad::g_loading_since_ms;
-        if (since && ZoneLoad::now_ms() - since < LoadingTimeoutMs) return L"loading the host's world - please wait...";
-        if (int percent = Net::zone_progress(); percent >= 0) return std::format(L"receiving the world from the host - {}%", percent);
-        if (!Net::connected()) return L"waiting for the host's game...";
-        if (PassengerSaveSync::restore_pending()) return L"restoring your inventory from the host - please wait...";
-        if (!g_world_synced) return L"connected - waiting for the host's world...";
+        // тексты — как карточка загрузки HUD (docs/design/HUD_PLAN.md): у игрока «водитель», не «host»
+        if (since && ZoneLoad::now_ms() - since < LoadingTimeoutMs) return L"loading the driver's world - please wait...";
+        if (int percent = Net::zone_progress(); percent >= 0) return std::format(L"receiving the world from the driver - {}%", percent);
+        if (!Net::connected()) return L"waiting for the driver's game...";
+        if (PassengerSaveSync::restore_pending()) return L"restoring your inventory from the driver";
+        if (!g_world_synced) return L"connected - waiting for the driver's world...";
         return {};
+    }
+
+    // phase() строит строки (format, wstring) — вызывается из тика каждый кадр, а меняется редко: пересчёт раз в 250 мс
+    std::wstring g_phase;
+    std::string g_phase_ascii;
+    uint64_t g_phase_at_ms = 0;
+
+    const std::wstring& phase_cached()
+    {
+        uint64_t now = ZoneLoad::now_ms();
+        if (!g_phase_at_ms || now - g_phase_at_ms >= 250)
+        {
+            g_phase_at_ms = now;
+            g_phase = phase();
+            g_phase_ascii.clear();
+            for (wchar_t c : g_phase) g_phase_ascii += static_cast<char>(c); // phase — ASCII
+        }
+        return g_phase;
+    }
+
+    const std::string& phase_ascii()
+    {
+        phase_cached();
+        return g_phase_ascii;
     }
 
     std::wstring text()
@@ -453,8 +519,7 @@ namespace Overlay
         // Второй ПК упал при запуске игры, через ~2 с после загрузки мода (dxgi, RTSS в процессе; дамп 23:51): в первые секунды
         // игра ещё создаёт окно и устройство отрисовки — наше окно topmost и сообщения её окну в это время ни к чему
         if (!g_ready_at_ms || ZoneLoad::now_ms() < g_ready_at_ms) return {};
-        auto p = phase();
-        return p.empty() ? p : L"Co-op: " + p;
+        return phase_cached(); // заголовок «Joining the driver's world» рисует само окно
     }
 } // namespace Overlay
 
@@ -464,7 +529,7 @@ public:
     PacificDriveCoop() : CppUserModBase()
     {
         ModName = STR("PacificDriveCoop");
-        ModVersion = STR("0.17.19");
+        ModVersion = STR("0.18.1");
         for (auto c : ModVersion) g_version += static_cast<char>(c); // версия — ASCII
         ModDescription = STR("2-player LAN coop: driver + passenger");
         ModAuthors = STR("sanokoo");
@@ -473,6 +538,7 @@ public:
         register_keydown_event(Input::Key::F10, {Input::ModifierKey::CONTROL}, [] { ZoneSave::g_requested = true; });
         register_keydown_event(Input::Key::F11, {Input::ModifierKey::CONTROL}, [] { ZoneLoad::g_requested = true; });
         register_keydown_event(Input::Key::E, {Input::ModifierKey::CONTROL}, [] { PassengerSync::g_key_pressed = true; });
+        register_keydown_event(Input::Key::Q, {Input::ModifierKey::CONTROL}, [] { if (g_net_config.client_drive) PassengerSync::g_key_driver = true; }); // сесть за руль (Client, client_drive=1)
         register_keydown_event(Input::Key::F12, {Input::ModifierKey::CONTROL}, [] { LootSync::g_simulate_peer_pick = true; });
         register_keydown_event(Input::Key::F8, {Input::ModifierKey::CONTROL}, [] { g_dump_item_props = true; }); // диагностика свойств предметов рюкзака
         register_keydown_event(Input::Key::F4, {Input::ModifierKey::CONTROL}, [] { g_dump_tintable = true; });
@@ -519,6 +585,13 @@ public:
         };
         g_net_events.on_door = [](Coop::PacketId id, const Coop::DoorBody& body) { DoorSync::on_door(id, body, g_net_config.role == Net::Role::Host); };
         g_net_events.on_pose = Presence::on_pose;
+        Net::on(Coop::DriveInput, DriveProbe::on_input); // только Host получает эти пакеты
+        Net::on(Coop::DriveAction, DriveProbe::on_action);
+        Net::on(Coop::LeechSpawn, LeechSync::on_spawn); // Client
+        Net::on(Coop::LeechState, LeechSync::on_state); // Client
+        Net::on(Coop::LeechGone, LeechSync::on_gone);   // Client
+        Net::on(Coop::LeechHello, LeechSync::on_hello); // Host
+        Net::on(Coop::LeechAction, LeechSync::on_action); // Host
         g_net_events.on_car_state = CarSync::on_car_state;
         g_net_events.on_loot = [](Coop::PacketId id, const Coop::LootBody& body) { LootSync::on_loot(id, body, g_net_config.role == Net::Role::Host); };
         g_net_events.on_seat = [](Coop::PacketId id, const Coop::SeatBody& body) { PassengerSync::on_seat(id, body, g_net_config.role == Net::Role::Host); };
@@ -533,13 +606,19 @@ public:
         g_net_events.on_census = ZoneTrace::on_peer_census; // сверка зоны
         g_net_events.on_weather = WeatherSync::on_weather;
         g_net_events.on_gate = GateSync::on_gate;
+        g_net_events.on_hand = Presence::on_hand;
         g_net_events.on_radio = RadioSync::on_radio;
         g_net_events.on_world_item = WorldItemSync::on_world_item;
         g_net_events.on_zone_save = [](std::vector<uint8_t>&& file) {
             std::error_code ec;
             std::filesystem::create_directories(ZoneSave::CoopDir, ec);
-            std::ofstream(ZoneSave::ZoneFile, std::ios::binary).write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+            if (!ZoneSave::write_atomic(ZoneSave::ZoneFile, file.data(), file.size()))
+            {
+                Output::send<LogLevel::Error>(STR("[ZoneSave] не удалось записать {} — зона НЕ загружается\n"), ZoneSave::ZoneFile.wstring());
+                return;
+            }
             Output::send<LogLevel::Verbose>(STR("[Timeline] +{} мс: сейв зоны получен и записан\n"), ZoneSave::since_connect());
+            StatusFile::mark_world_saved();
             Notify::push(Notify::Kind::Info, "Got the driver's world, loading it");
             ZoneLoad::g_requested = true; // клиент сразу грузит присланную зону
         };
@@ -561,46 +640,69 @@ public:
         ZoneSave::g_tick_id = Hook::RegisterEngineTickPreCallback(
                 [](Hook::TCallbackIterationData<void>&, UEngine*, float delta_seconds, bool) {
                     const bool host = g_net_config.role == Net::Role::Host;
-                    Diag::perf(0, [&] { Net::tick(g_net_events); });
-                    Diag::perf(1, [&] { Presence::tick(delta_seconds); });
-                    Diag::perf(2, [&] { CarSync::tick(delta_seconds, host); });
-                    Diag::perf(3, [&] { PassengerSync::tick(host); });
-                    Diag::perf(4, [&] { LootSync::tick(host); });
-                    Diag::perf(5, [&] { DoorSync::tick(host); });
-                    Diag::perf(6, [&] { SystemsSync::tick(host); });
-                    Diag::perf(7, [&] { GarageSync::tick(host); });
-                    Diag::perf(8, [&] { PartsSync::tick(host); });
-                    Diag::perf(9, [&] { TrunkSync::tick(host); });
-                    Diag::perf(10, [&] { Diag::tick(host); });
-                    Diag::perf(11, [&] { PassengerSaveSync::tick(host, ZoneLoad::current_slot_file); });
-                    Diag::perf(12, [&] { StatusFile::tick(ZoneSave::CoopDir / "status.txt", g_version, g_net_config.role, [] { std::string s; for (wchar_t c : Overlay::phase()) s += static_cast<char>(c); return s; }()); }); // phase — ASCII
-                    Diag::perf(13, [&] { QuirkSync::tick(host); });
-                    Diag::perf(14, [&] { AnchorSync::tick(host); });
-                    Diag::perf(15, [&] { ZoneTrace::tick(); });
-                    LiveConfig::tick();
-                    RadioSync::tick(host);
-                    WeatherSync::tick(host);
-                    GateSync::tick(host);
-                    HeapGuard::tick(host, g_net_config.heap_test);
-                    WorldItemSync::tick(host);
-                    Notify::tick(Net::connected(), host, DoorSync::known_mask());
-                    Diag::perf_report();
-                    if (g_dump_item_props.exchange(false)) ItemProps::dump_backpack();
-                    if (g_selftest_item_props.exchange(false)) ItemProps::selftest_write();
-                    if (g_dump_tintable.exchange(false)) ItemProps::dump_tintable();
-                    if (g_dump_object.exchange(false)) ObjectDump::dump_target();
-                    StatusOverlay::set(Overlay::text());
-                    AutoSave::tick();
-                    ZoneSave::tick();
-                    ZoneLoad::tick();
+                    // Каждый модуль — через Guard: сбой одного не роняет игру (Sync/Guard.h); id < Diag::PerfCount попадает ещё и в замер [Perf]
+                    auto step = [](int id, const wchar_t* name, auto&& fn) {
+                        auto run = [&] {
+                            auto r = Guard::run(id, fn);
+                            if (r.state == Guard::State::Fault || r.state == Guard::State::Disabled)
+                                Output::send<LogLevel::Error>(STR("[Guard] модуль {} упал ({}){}\n"), name, r.code ? std::format(L"SEH {:#X}", r.code) : std::wstring(L"C++ исключение"),
+                                                              r.state == Guard::State::Disabled ? STR(" — выключен до смены карты") : STR(""));
+                        };
+                        if (id < Diag::PerfCount) Diag::perf(id, run);
+                        else run();
+                    };
+                    step(0, L"Net", [&] { Net::tick(g_net_events); });
+                    step(1, L"Presence", [&] { Presence::tick(delta_seconds, g_net_config.hand_fx); });
+                    step(2, L"CarSync", [&] { CarSync::tick(delta_seconds, host); });
+                    step(3, L"PassengerSync", [&] { PassengerSync::tick(host); });
+                    step(4, L"LootSync", [&] { LootSync::tick(host); });
+                    step(5, L"DoorSync", [&] { DoorSync::tick(host); });
+                    step(6, L"SystemsSync", [&] { SystemsSync::tick(host); });
+                    step(7, L"GarageSync", [&] { GarageSync::tick(host); });
+                    step(8, L"PartsSync", [&] { PartsSync::tick(host); });
+                    step(9, L"TrunkSync", [&] { TrunkSync::tick(host); });
+                    step(10, L"Diag", [&] { Diag::tick(host); });
+                    step(11, L"PassengerSaveSync", [&] { PassengerSaveSync::tick(host, ZoneLoad::current_slot_file); });
+                    step(12, L"StatusFile", [&] { StatusFile::tick(ZoneSave::CoopDir / "status.txt", g_version, g_net_config.role, Overlay::phase_ascii()); });
+                    step(13, L"QuirkSync", [&] { QuirkSync::tick(host); });
+                    step(14, L"AnchorSync", [&] { AnchorSync::tick(host); });
+                    step(15, L"ZoneTrace", [&] { ZoneTrace::tick(); });
+                    step(31, L"LiveConfig", [&] { LiveConfig::tick(); });
+                    step(16, L"HudFeed", [&] { HudFeed::tick(ZoneSave::CoopDir / "hud.txt", host); }); // id < PerfCount — в замере [Perf]
+                    step(17, L"RadioSync", [&] { RadioSync::tick(host); });
+                    step(18, L"WeatherSync", [&] { WeatherSync::tick(host); });
+                    step(19, L"GateSync", [&] { GateSync::tick(host); });
+                    step(20, L"HeapGuard", [&] { HeapGuard::tick(host, g_net_config.heap_test); });
+                    step(21, L"DriveProbe", [&] { DriveProbe::tick(g_net_config.drive_probe_throttle, g_net_config.drive_probe_steer); });
+                    step(22, L"DriveProbeClient", [&] { DriveProbe::client_tick(!host && g_net_config.client_drive && PassengerSync::driving() && Net::connected()); });
+                    step(23, L"WorldItemSync", [&] { WorldItemSync::tick(host); });
+                    step(32, L"LeechSync", [&] { LeechSync::tick(host); });
+                    step(24, L"Notify", [&] { Notify::tick(Net::connected(), host, DoorSync::known_mask()); });
+                    step(25, L"PerfReport", [&] { Diag::perf_report(); });
+                    step(26, L"Dumps", [&] {
+                        if (g_dump_item_props.exchange(false)) ItemProps::dump_backpack();
+                        if (g_selftest_item_props.exchange(false)) ItemProps::selftest_write();
+                        if (g_dump_tintable.exchange(false)) ItemProps::dump_tintable();
+                        if (g_dump_object.exchange(false)) ObjectDump::dump_target();
+                    });
+                    step(27, L"StatusOverlay", [&] { StatusOverlay::set(Overlay::text()); });
+                    step(28, L"AutoSave", [&] { AutoSave::tick(); });
+                    step(29, L"ZoneSave", [&] { ZoneSave::tick(); });
+                    step(30, L"ZoneLoad", [&] { ZoneLoad::tick(); });
                 },
                 {false, false, STR("PacificDriveCoop"), STR("ZoneSave")});
         m_load_map_pre_id = Hook::RegisterLoadMapPreCallback(
-                [](Hook::TCallbackIterationData<bool>&, UEngine*, FWorldContext&, FURL, UPendingNetGame*, FString&) { AnchorSync::on_map_loading(); },
+                [](Hook::TCallbackIterationData<bool>&, UEngine*, FWorldContext&, FURL, UPendingNetGame*, FString&) {
+                    UFunctionCall::clear_cache(); // старый мир выгружается: классы уйдут, их адреса займут новые (повтор — в LoadMapPost)
+                    AnchorSync::on_map_loading();
+                    LeechSync::on_map_loading();
+                },
                 {false, true, STR("PacificDriveCoop"), STR("MapLoading")});
         m_load_map_id = Hook::RegisterLoadMapPostCallback(
                 [](Hook::TCallbackIterationData<bool>&, UEngine*, FWorldContext&, FURL, UPendingNetGame*, FString&) {
                     AutoSave::g_map_loaded = true;
+                    Guard::reset(); // выключенные сбоем модули получают второй шанс на новой карте
+                    Cached::on_map_loaded(); // списки объектов (Cached::All) — перечитать на новой карте
                     UFunctionCall::clear_cache();
                     Overlay::on_map_loaded();
                     Presence::on_map_loaded();
@@ -618,10 +720,12 @@ public:
                     WeatherSync::on_map_loaded();
                     GateSync::on_map_loaded();
                     WorldItemSync::on_map_loaded();
+                    LeechSync::on_map_loaded();
                 },
                 {false, true, STR("PacificDriveCoop"), STR("AutoSave")});
         ZoneTrace::install(g_net_config.role == Net::Role::Host);
         AnchorSync::install();
+        LeechSync::install();
         Output::send<LogLevel::Verbose>(STR("[PacificDriveCoop] хуки: EngineTick {}, LoadMap {}\n"), ZoneSave::g_tick_id ? STR("есть") : STR("НЕТ"),
                                         m_load_map_id ? STR("есть") : STR("НЕТ"));
     }

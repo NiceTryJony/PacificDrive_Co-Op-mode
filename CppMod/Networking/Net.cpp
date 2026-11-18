@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,8 +26,10 @@ namespace Net
     namespace
     {
         constexpr uint32_t BulkInFlightBytes = 128 * 1024; // сколько файла одновременно «в воздухе»: остальное ждёт, события идут вперёд
+        constexpr uint32_t MaxFileBytes = 64 * 1024 * 1024; // сейв зоны ~10 МБ; больше — это не сейв
         constexpr uint64_t StatsIntervalMs = 10'000;
-        constexpr uint32_t TimeoutMinMs = 15'000, TimeoutMaxMs = 45'000; // игровой поток связь больше не держит
+        // Игровой поток связь больше не держит. Закрытие/вылет игры напарника иначе не видно: при 15/45 с HUD писал «left» через ~25 с
+        constexpr uint32_t TimeoutMinMs = 5'000, TimeoutMaxMs = 10'000;
 
         Config g_config;
         ENetHost* g_host = nullptr;
@@ -100,7 +104,7 @@ namespace Net
         {
             switch (id)
             {
-            case Coop::CarState: case Coop::HostPose: case Coop::PassengerPose: case Coop::CarSystems: case Coop::QuirkSet: case Coop::RadioTrack: case Coop::ZoneCensus:
+            case Coop::CarState: case Coop::HostPose: case Coop::PassengerPose: case Coop::DriveInput: case Coop::CarSystems: case Coop::QuirkSet: case Coop::RadioTrack: case Coop::ZoneCensus:
                 return id;
             default:
                 return 0;
@@ -152,6 +156,12 @@ namespace Net
         {
             auto* chunk = Coop::body_of<Coop::ZoneChunkBody>(data, size);
             if (!chunk || !chunk->Total) return false;
+            if (chunk->Total > MaxFileBytes) // размер из пакета: мусор не должен выделять гигабайты на игровом потоке
+            {
+                events.log(std::format(L"[Net] {}: размер {} байт больше допустимого — отброшен", what, chunk->Total));
+                rx.id = 0;
+                return false;
+            }
             const uint8_t* bytes = data + sizeof(Coop::Header) + sizeof(Coop::ZoneChunkBody);
             size_t length = size - sizeof(Coop::Header) - sizeof(Coop::ZoneChunkBody);
             if (chunk->TransferId != rx.id || chunk->Offset == 0)
@@ -241,6 +251,9 @@ namespace Net
             case Coop::WeatherEvent:
                 if (std::string tag, path; events.on_weather && Coop::parse_part(data, size, tag, path)) events.on_weather(tag, path);
                 break;
+            case Coop::HandItem:
+                if (std::string tag, path; events.on_hand && Coop::parse_part(data, size, tag, path)) events.on_hand(tag, path);
+                break;
             case Coop::GateState:
                 if (std::string tag, path; events.on_gate && Coop::parse_part(data, size, tag, path)) events.on_gate(tag, path);
                 break;
@@ -295,6 +308,7 @@ namespace Net
                 break;
             case Coop::AnchorTaken:
             case Coop::PortalActive:
+            case Coop::GeneratorBroken:
             case Coop::Mark:
                 if (auto* b = Coop::body_of<Coop::AnchorBody>(data, size); b && events.on_anchor) events.on_anchor(static_cast<Coop::PacketId>(data[0]), *b);
                 break;
@@ -503,9 +517,26 @@ namespace Net
             else if (key == "status_overlay") config.status_overlay = value != "0";
             else if (key == "client_parts") config.client_parts = value != "0";
             else if (key == "heap_test") config.heap_test = value != "0";
+            else if (key == "client_drive") config.client_drive = value != "0";
+            else if (key == "hand_fx") config.hand_fx = value != "0";
+            else if (key == "drive_probe_throttle") config.drive_probe_throttle = static_cast<float>(std::atof(value.c_str()));
+            else if (key == "drive_probe_steer") config.drive_probe_steer = static_cast<float>(std::atof(value.c_str()));
             else if (key == "sim_loss") config.sim_loss_percent = static_cast<float>(std::atof(value.c_str()));
         }
         fclose(f);
+        // Мусор в coop.ini (nan, значение вне разумного диапазона, порт 0) не должен ломать игру: берём значение по умолчанию.
+        // Файл правят руками и лаунчер, а читается он и при живой перезагрузке настроек
+        const Config def;
+        auto fix = [](float& v, float fallback, float lo, float hi) {
+            if (!std::isfinite(v) || v < lo || v > hi) v = fallback;
+        };
+        fix(config.seat_x, def.seat_x, -1000, 1000), fix(config.seat_y, def.seat_y, -1000, 1000), fix(config.seat_z, def.seat_z, -1000, 1000);
+        fix(config.seat_right_x, def.seat_right_x, -1000, 1000), fix(config.seat_right_y, def.seat_right_y, -1000, 1000), fix(config.seat_right_z, def.seat_right_z, -1000, 1000);
+        fix(config.exit_side_cm, def.exit_side_cm, 0, 2000);
+        fix(config.sim_loss_percent, def.sim_loss_percent, 0, 100);
+        fix(config.drive_probe_throttle, def.drive_probe_throttle, -1, 1), fix(config.drive_probe_steer, def.drive_probe_steer, -1, 1);
+        if (config.port == 0) config.port = Coop::DefaultPort;
+        if (config.host_ip.empty()) config.host_ip = def.host_ip;
         return config;
     }
 
@@ -560,11 +591,22 @@ namespace Net
             std::lock_guard lock(g_in_mutex);
             batch.swap(g_in);
         }
+        // Загрузка карты блокирует игровой поток на ~10 с: в очереди копятся сотни устаревших состояний (поза, машина). Как и в исходящей
+        // очереди, из состояний с ключом оставляем самое новое каждого вида — иначе после загрузки пик и откат объектов на старые значения
+        std::bitset<256> seen;
+        for (size_t i = batch.size(); i-- > 0;)
+        {
+            auto& in = batch[i];
+            if (in.kind != InKind::Packet || in.data.empty() || !default_key(static_cast<Coop::PacketId>(in.data[0]))) continue;
+            if (seen.test(in.data[0])) in.data.clear();
+            else seen.set(in.data[0]);
+        }
         for (auto& in : batch)
         {
             switch (in.kind)
             {
             case InKind::Packet:
+                if (in.data.empty()) break; // вытеснен более новым состоянием
                 on_receive(in.data.data(), in.data.size(), events);
                 break;
             case InKind::Connected:

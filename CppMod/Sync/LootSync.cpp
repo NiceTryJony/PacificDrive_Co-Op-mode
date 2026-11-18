@@ -124,17 +124,25 @@ namespace LootSync
             return archetype && *archetype ? (*archetype)->GetName() : StringType{};
         }
 
-        // Ищет учтённый предмет и помечает снятым; nullptr — такого в учёте нет
+        // Ищет учтённый предмет и помечает снятым; nullptr — такого в учёте нет. Одинаковые предметы одного контейнера
+        // (3 скотча в багажнике) делят ключ архетип + якорь — берём ещё не снятый, иначе второй скотч получал отказ (тест 2026-11-17 21:23)
         Tracked* take_tracked(const Coop::LootBody& loot, bool* was_done = nullptr)
         {
+            Tracked* done = nullptr;
             for (auto& item : g_items)
             {
                 if (!matches(loot, item.Archetype, item.Position)) continue;
-                if (was_done) *was_done = item.Done;
+                if (item.Done)
+                {
+                    if (!done) done = &item;
+                    continue;
+                }
+                if (was_done) *was_done = false;
                 item.Done = true;
                 return &item;
             }
-            return nullptr;
+            if (done && was_done) *was_done = true;
+            return done;
         }
 
         Vec actor_location(UObject* actor)
@@ -177,7 +185,9 @@ namespace LootSync
             if (std::fabs(anchor.X) + std::fabs(anchor.Y) + std::fabs(anchor.Z) < OriginEpsilon) return false;
             auto slot = outer_slot(instance);
             if (!slot) return false; // GetOuterSlot нет — подбор не отследить
-            Tracked item{FWeakObjectPtr(instance), fnv1a(archetype_name(instance)), anchor, *slot, false};
+            auto name = archetype_name(instance);
+            if (name.starts_with(STR("IA_Hazard_Leech"))) return false; // пиявки ползают и их ведёт LeechSync — не лут
+            Tracked item{FWeakObjectPtr(instance), fnv1a(name), anchor, *slot, false};
             if (actor) item.Actor = FWeakObjectPtr(actor), item.HasActor = true;
             return track(item);
         }
@@ -243,10 +253,12 @@ namespace LootSync
                 }
             }
             // 4. Содержимое багажников машин-доноров: ItemContainer с Outer = ItemInstance актёра BP_TemplatePart_TrunkContents_C
-            //    (RECON.md 6.27; тест 2026-11-06: Client взял 5 и 8 предметов, у Host не убавилось). Якорь — сам багажник
+            //    (RECON.md 6.27; тест 2026-11-06: Client взял 5 и 8 предметов, у Host не убавилось). Якорь — сам багажник.
+            //    Кузова грузовиков (BP_TemplatePart_TruckBedContainer_C, тест 2026-11-17 21:22) устроены так же
             int in_trunks = 0;
             actors.clear();
             UObjectGlobals::FindAllOf(STR("BP_TemplatePart_TrunkContents_C"), actors);
+            UObjectGlobals::FindAllOf(STR("BP_TemplatePart_TruckBedContainer_C"), actors);
             if (!actors.empty())
             {
                 std::vector<UObject*> containers;
@@ -345,7 +357,7 @@ namespace LootSync
             // Наш экземпляр уже у нас в инвентаре — учёт помечен снятым, но слабый указатель жив
             for (auto& item : g_items)
             {
-                if (!matches(loot, item.Archetype, item.Position)) continue;
+                if (!item.Done || !matches(loot, item.Archetype, item.Position)) continue; // не снятый — ещё лежит в контейнере, не наш
                 if (UObject* instance = item.Instance.Get()) remove_instance(instance);
                 Output::send<LogLevel::Verbose>(STR("[Loot] этот предмет уже забрал Host — убран из моего инвентаря\n"));
                 break;

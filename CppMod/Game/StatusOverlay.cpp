@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cwctype>
 #include <mutex>
 #include <thread>
 
@@ -25,7 +26,26 @@ namespace StatusOverlay
         std::wstring g_shown;           // поток окна: что нарисовано сейчас
         std::wstring g_original_title;  // заголовок окна игры до наших правок
         HWND g_title_window = nullptr;
-        int g_font_px = 26;            // размер шрифта текущей надписи (считает layout, использует отрисовка)
+        int g_font_px = 20;            // размер шрифта заголовка (считает layout от высоты окна игры, использует отрисовка)
+        int g_title_h = 25;            // высота строки заголовка по замеру layout
+
+        // Вид — как карточка загрузки HUD (docs/design/HUD_PLAN.md, вариант B): тёмная плашка, кремовая рамка, скругление
+        constexpr COLORREF Glass = RGB(24, 20, 17), Cream = RGB(239, 230, 207), CreamSoft = RGB(185, 178, 159);
+        constexpr wchar_t Title[] = L"Joining the driver's world";
+        HFONT make_font(int px, int weight, const wchar_t* face)
+        {
+            return CreateFontW(-px, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+        }
+        HFONT title_font() { return make_font(g_font_px, FW_SEMIBOLD, L"Bahnschrift"); } // нет шрифта — Windows подставит похожий
+        HFONT body_font() { return make_font(g_font_px * 4 / 5, FW_NORMAL, L"Segoe UI"); }
+        int pad() { return g_font_px; }
+        int radius() { return g_font_px * 4 / 5; }
+        // Текст фазы — со строчной (status.txt), в окне — с заглавной
+        std::wstring body_text(std::wstring s)
+        {
+            if (!s.empty()) s[0] = static_cast<wchar_t>(towupper(s[0]));
+            return s;
+        }
 
         // Главное окно игры: видимое окно верхнего уровня нашего процесса без владельца (UE4: класс UnrealWindow)
         HWND find_game_window()
@@ -66,7 +86,7 @@ namespace StatusOverlay
                 g_title_window = game;
                 g_original_title = buf;
             }
-            std::wstring title = text.empty() ? g_original_title : g_original_title + L"  |  " + text;
+            std::wstring title = text.empty() ? g_original_title : g_original_title + L"  |  Co-op: " + text;
             DWORD_PTR ignored = 0;
             SendMessageTimeoutW(game, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(title.c_str()), SMTO_ABORTIFHUNG, MessageTimeoutMs, &ignored);
         }
@@ -78,19 +98,24 @@ namespace StatusOverlay
             POINT origin{0, 0};
             ClientToScreen(game, &origin);
             int width = client.right - client.left, height = client.bottom - client.top;
-            // Размер шрифта — от высоты окна игры (1080p → 26 px)
-            int font_px = g_font_px = std::clamp(height / 42, 16, 48);
+            // Размер шрифта — от высоты окна игры (1080p → заголовок 20 px, как карточка HUD)
+            g_font_px = std::clamp(height / 54, 14, 40);
             HDC dc = GetDC(hwnd);
-            HFONT font = CreateFontW(-font_px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                     CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-            HGDIOBJ old = SelectObject(dc, font);
-            RECT box{0, 0, 0, 0};
-            DrawTextW(dc, text.c_str(), -1, &box, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-            SelectObject(dc, old);
-            DeleteObject(font);
+            auto measure = [dc](HFONT font, const std::wstring& s) {
+                HGDIOBJ old = SelectObject(dc, font);
+                RECT box{0, 0, 0, 0};
+                DrawTextW(dc, s.c_str(), -1, &box, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(dc, old);
+                DeleteObject(font);
+                return SIZE{box.right, box.bottom};
+            };
+            SIZE title = measure(title_font(), Title), body = measure(body_font(), body_text(text));
             ReleaseDC(hwnd, dc);
-            int pad = font_px, w = std::min<int>(box.right - box.left + 2 * pad, width), h = box.bottom - box.top + pad;
+            g_title_h = title.cy;
+            int w =std::min<int>(std::max(title.cx, body.cx) + 2 * pad(), width), h = title.cy + body.cy + pad() * 3 / 2;
             SetWindowPos(hwnd, HWND_TOPMOST, origin.x + (width - w) / 2, origin.y + height / 12, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            // Скруглённые углы — формой окна (рисуем только внутри неё); окно владеет регионом, удалять его не нужно
+            SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, radius() * 2, radius() * 2), TRUE);
         }
 
         void tick(HWND hwnd)
@@ -131,20 +156,28 @@ namespace StatusOverlay
                 HDC dc = BeginPaint(hwnd, &ps);
                 RECT rc;
                 GetClientRect(hwnd, &rc);
-                HBRUSH background = CreateSolidBrush(RGB(20, 20, 24));
+                HBRUSH background = CreateSolidBrush(Glass);
                 FillRect(dc, &rc, background);
                 DeleteObject(background);
-                HBRUSH border = CreateSolidBrush(RGB(255, 170, 40));
-                FrameRect(dc, &rc, border);
-                DeleteObject(border);
-                HFONT font = CreateFontW(-g_font_px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                         CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-                HGDIOBJ old = SelectObject(dc, font);
+                // рамка 3 px (на 1080p) внутри формы окна
+                HPEN pen = CreatePen(PS_INSIDEFRAME, std::max(2, g_font_px * 3 / 20), Cream);
+                HGDIOBJ old_pen = SelectObject(dc, pen), old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                RoundRect(dc, 0, 0, rc.right, rc.bottom, radius() * 2, radius() * 2);
+                SelectObject(dc, old_pen);
+                SelectObject(dc, old_brush);
+                DeleteObject(pen);
                 SetBkMode(dc, TRANSPARENT);
-                SetTextColor(dc, RGB(255, 255, 255));
-                DrawTextW(dc, g_shown.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-                SelectObject(dc, old);
-                DeleteObject(font);
+                auto line = [dc, &rc](HFONT font, COLORREF color, const std::wstring& s, int top) {
+                    HGDIOBJ old = SelectObject(dc, font);
+                    SetTextColor(dc, color);
+                    RECT r{pad(), top, rc.right - pad(), rc.bottom};
+                    DrawTextW(dc, s.c_str(), -1, &r, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                    SelectObject(dc, old);
+                    DeleteObject(font);
+                };
+                int top = pad() * 3 / 5;
+                line(title_font(), Cream, Title, top);
+                line(body_font(), CreamSoft, body_text(g_shown), top + g_title_h + pad() / 4);
                 EndPaint(hwnd, &ps);
                 return 0;
             }

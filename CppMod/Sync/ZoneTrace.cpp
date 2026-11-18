@@ -38,7 +38,8 @@ namespace ZoneTrace
         uint64_t g_second = 0;
         int g_lines = 0, g_dropped = 0;
         std::unordered_set<AActor*> g_seen;     // EndPlay пишем только для тех, чьё появление записали
-        uint64_t g_census_last = 0;             // 0 — срез на ближайшем тике (метка Ctrl+F7)
+        // Срез перебирает всех актёров (рывок ~30 мс): только раз после загрузки карты и по метке Ctrl+F7 (своей или собеседника)
+        bool g_census_due = false;
         std::wstring g_census_line;
 
         uint64_t now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -144,6 +145,9 @@ namespace ZoneTrace
     static bool compare_noise(const StringType& cls)
     {
         if (cls == STR("Actor")) return true;
+        // BP_ToDDirector.SetupTODEventItemAndActor создаёт новый IA_WeatherEventItem при каждой загрузке карты, не ища сохранённые (байткод 2026-11-18):
+        // они копятся в сейве, а Client к сейву Host добавляет свой — всегда на один больше. На игру не влияет
+        if (cls.ends_with(STR(":IA_WeatherEventItem"))) return true;
         for (auto* part : {STR("BP_IF_"), STR("BP_ClumpedSpawnMarker"), STR("BP_ClumpedArea"), STR("BP_SpawnPoint_C"), STR("PrefabSettingsActor"),
                            STR("BP_Spawn_PreHazardHelper"), STR("BP_Spawn_Resource"), STR("BP_PrefabSelfDeletor"), STR("PFX_"), STR("BP_Tool_Target_"),
                            STR("BP_HandItem_"), STR("BP_CarItemInstall"), STR("BP_AmbientEvent"), STR("PointLight"), STR("SpotLight"), STR("BP_CarScrapeFX"),
@@ -279,12 +283,11 @@ namespace ZoneTrace
             if (Net::connected() && !std::isnan(at.X))
                 Net::send_anchor({static_cast<int32_t>(std::lround(at.X)), static_cast<int32_t>(std::lround(at.Y)), static_cast<int32_t>(std::lround(at.Z))}, Coop::Mark);
             Notify::push(Notify::Kind::Info, "Mark saved to the log");
-            g_census_last = 0;
+            g_census_due = true;
             g_census_line.clear(); // срез в лог, даже если ничего не изменилось
         }
-        uint64_t now = now_ms();
-        if (now < g_quiet_until || now - g_census_last < 30'000) return;
-        g_census_last = now;
+        if (!g_census_due || now_ms() < g_quiet_until) return;
+        g_census_due = false;
         std::vector<UObject*> actors;
         UObjectGlobals::FindAllOf(STR("Actor"), actors);
         std::map<StringType, int> counts;
@@ -329,7 +332,7 @@ namespace ZoneTrace
     void on_peer_mark(const Coop::AnchorBody& at)
     {
         Output::send<LogLevel::Verbose>(STR("[Mark] {} метка собеседника у ({}, {}, {})\n"), g_who, at.X, at.Y, at.Z);
-        g_census_last = 0;
+        g_census_due = true;
         g_census_line.clear();
     }
 
@@ -342,6 +345,7 @@ namespace ZoneTrace
         g_notified.clear();
         g_diff_line.clear();
         g_quiet_until = now_ms() + SettleMs;
+        g_census_due = true; // срез, когда карта устоится
         Output::send<LogLevel::Verbose>(STR("[Zone] {} карта загружена, пишу появления через {} с\n"), g_who, SettleMs / 1000);
     }
 } // namespace ZoneTrace

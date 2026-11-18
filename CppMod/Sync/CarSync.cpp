@@ -50,6 +50,7 @@ namespace CarSync
         std::atomic<bool> g_map_loaded{false};
         std::deque<Snapshot> g_snapshots;
         UObject* g_car = nullptr;
+        FWeakObjectPtr g_car_weak; // g_car без смены карты могут уничтожить (эвакуация) — см. Cached::drop_if_dead
         bool g_kinematic = false, g_missing_logged = false;
         uint64_t g_last_send_ms = 0;
         Coop::CarStateBody g_applied{}; // куда кукла поставлена последним apply()
@@ -248,7 +249,7 @@ namespace CarSync
                 release_car(L"Host молчит 5 с");
                 return;
             }
-            if (!g_car) g_car = find_car();
+            if (!g_car) Cached::track(g_car = find_car(), g_car_weak);
             if (!g_car)
             {
                 if (!g_missing_logged) Output::send<LogLevel::Warning>(STR("[CarSync] машины в мире нет — CarState игнорируется\n"));
@@ -321,6 +322,13 @@ namespace CarSync
 
     void tick(float, bool is_host)
     {
+        if (Cached::drop_if_dead(g_car, g_car_weak))
+        {
+            g_kinematic = false; // физику новой машине выключит client_tick заново
+            g_wheels.clear();
+            g_ground_offset.reset();
+            Output::send<LogLevel::Verbose>(STR("[CarSync] машина уничтожена игрой — найду заново\n"));
+        }
         if (g_map_loaded.exchange(false))
         {
             g_car = nullptr; // старая машина ушла вместе с миром; новую найдём заново
@@ -344,7 +352,7 @@ namespace CarSync
         uint64_t now = now_ms();
         if (now - g_last_send_ms < Net::adaptive_interval_ms(Coop::CarStateIntervalMs)) return;
         g_last_send_ms = now;
-        if (!g_car) g_car = find_car();
+        if (!g_car) Cached::track(g_car = find_car(), g_car_weak);
         if (g_car) send_state(g_car);
     }
 } // namespace CarSync

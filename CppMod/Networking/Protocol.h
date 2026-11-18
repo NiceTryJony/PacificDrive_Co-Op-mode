@@ -12,7 +12,7 @@ namespace Coop
 {
     constexpr uint16_t DefaultPort = 47777;
     // Версия протокола уходит в ENet connect(data): Host отклоняет несовпавшую. Менять при любом изменении формата пакетов
-    constexpr uint32_t ProtocolVersion = 4;
+    constexpr uint32_t ProtocolVersion = 6;
     // Классы приоритета = каналы ENet (у каждого свой порядок доставки: застрявший пакет не держит остальные)
     enum Priority : uint8_t
     {
@@ -63,8 +63,19 @@ namespace Coop
         WeatherEvent = 42, // Host→Client (PartBody): тег "wev" + путь класса WEV_* (пусто — нет события) или тег "lvl" + 6 уровней погоды текстом
         Mark = 44,         // оба: игрок нажал Ctrl+F7 «здесь что-то не так» (AnchorBody — где он стоит) — метка в лог собеседника
         ZoneCensus = 45,   // оба: срез зоны (PartBody: тег — имя карты, значение — «Класс=число …») для сверки [ZoneDiff]
-        GateState = 46,    // оба: ворота выезда гаража (GSS_Garage_ExitGateOpened) сменились у отправителя (PartBody: тег "gate", значение "1" открыты / "0" закрыты)
+        GateState = 46,    // оба (Host — всё раскрытое; Client — раскрытое у него выше, чем у Host): раскрытые отрезки маршрута (PartBody: тег "legs", значение «индекс RouteShapeLeg:статус» через запятую) — от статуса 2 открываются ворота гаража
         HazardSpawn = 43,  // Host→Client: аномалия от взятия якоря (PartBody: тег "x y z pitch yaw roll" + путь класса) — создать там же
+        DriveInput = 47,   // Client→Host: ввод Client-водителя (DriveInputBody) — Host подставляет в ось газа/руля; нули при обрыве и высадке
+        // Пиявки (LeechSync, design/LEECH_PLAN.md): Host ведёт, у Client марионетки
+        LeechSpawn = 50, // Host→Client: u16 номер, float x y z, int16 pitch yaw roll (pack_angle), путь архетипа — создать марионетку;
+                         // Client→Host (номер 0): Client выбросил пиявку из рук — Host создаёт настоящую и ведёт её
+        LeechState = 51, // Host→Client, unreliable: u8 число, на каждую u16 номер, u8 флаги (LeechOnChassis), float x y z, int16 pitch yaw roll
+        LeechGone = 52,  // Host→Client: u16 номер — пиявки у Host больше нет
+        LeechHello = 53, // Client→Host: карта у меня готова, пришли всех пиявок заново (без тела)
+        GeneratorBroken = 49, // оба: плазменный генератор в этой точке сломан (AnchorBody) — сломать у себя (поломка при появлении — случай, при сборе — всегда)
+        LeechAction = 55, // Client→Host: u16 номер пиявки Host, u8 действие (LeechKnockOff / LeechKill) — Client сделал это с марионеткой, Host повторяет у своей
+        HandItem = 54,    // оба: что у отправителя в руке (PartBody: тег "hand", значение — путь меша BaseMesh предмета; пусто — рука пуста) — у куклы показываем меш
+        DriveAction = 48,  // Client→Host: действие Client-водителя в салоне (DriveActionBody) — гудок, дворники, свет, зажигание, коробка, способность; Host вызывает у себя
     };
 
     inline Priority priority_of(PacketId id)
@@ -73,7 +84,7 @@ namespace Coop
         {
         case PassengerAttach: case PassengerDetach: case RequestSeat: case RequestExitVehicle: case PassengerSaveRequest: case Ping:
             return PrioCritical;
-        case CarState: case HostPose: case PassengerPose:
+        case CarState: case HostPose: case PassengerPose: case DriveInput: case LeechState:
             return PrioRealtime;
         case WeatherEvent: case RadioTrack: case ZoneCensus: case Mark:
             return PrioBackground;
@@ -139,6 +150,32 @@ namespace Coop
         return {w.X, w.Y, w.Z, unpack_angle(w.Pitch), unpack_angle(w.Yaw), unpack_angle(w.Roll), unpack_speed(w.VX), unpack_speed(w.VY), unpack_speed(w.VZ)};
     }
 
+    // Ввод Client-водителя. Оси −127…127 = −1…1 (газ: минус = назад, как AccelerateBrake). Дальше — по плану: коробка/ручник запросом отдельно
+    struct DriveInputBody
+    {
+        int8_t Steer;    // SteerLeftRight
+        int8_t Throttle; // AccelerateBrake
+        uint8_t Flags;   // 0 — зарезервировано; нули = «не за рулём»
+    };
+    constexpr uint32_t DriveInputIntervalMs = 33; // ~30 Гц, как событие газа в игре
+
+    // Действие в салоне. Value — новое состояние (bool / зажигание 0..2 / коробка 0..1 / «нажата» для способности), Arg — слот способности
+    enum DriveActionKind : uint8_t
+    {
+        DriveHorn = 1,    // ToggleCarHorn(Active)
+        DriveWipers = 2,  // BP_CarManager_C.SetWipersOnOffVariable
+        DriveLights = 3,  // Set Headlights On
+        DriveIgnition = 4, // BP_CarManager_C.SetCarIgnitionState
+        DriveGear = 5,    // ToggleGearBoxState
+        DriveAbility = 6, // SetAbilityPressed(Slot, Pressed)
+    };
+    struct DriveActionBody
+    {
+        uint8_t Kind;
+        uint8_t Value;
+        uint8_t Arg;
+    };
+
     struct SeatBody
     {
         uint8_t Seat;   // 0 — задний левый, 1 — задний правый, SeatAny — любой свободный
@@ -151,7 +188,9 @@ namespace Coop
         SeatBlockedByModule = 1, // в слоте заднего ряда стоит модуль (спека 3.3.3)
         SeatNoCar = 2,
         SeatDoorClosed = 3,      // задняя дверь с этой стороны закрыта (откройте её или снимите)
+        SeatDriverBusy = 4,      // место 2 (водитель): персонаж Host сидит в машине
     };
+    constexpr uint8_t SeatDriver = 2; // Client за рулём (client_drive): мод сажает его на точку водителя, как на заднее сиденье
 
     // Двери машины: 6 штук, EOpenableDoors 0..5 (BP_CarManager_C.DoorStates, RECON.md «6.2»); бит i = дверь i открыта.
     // DoorState: Changed — какие двери только что изменились (Client применяет только их), Mask — состояние всех шести.
@@ -188,15 +227,18 @@ namespace Coop
         uint8_t Fuel;
         uint8_t Battery;
         uint8_t Radio;
+        uint8_t Wipers; // 0/1, BP_CarManager_C.WiperBladesOnOff (протокол 5)
     };
     constexpr uint8_t IgnitionMax = 2;
+    constexpr uint8_t LeechKnockOff = 1, LeechKill = 2, LeechTake = 3; // LeechAction: сбита (KnockOff) / убита (здоровье 0) / подобрана Client-ом
+    constexpr uint8_t LeechOnChassis = 1; // LeechState: позиция и поворот — относительно Chassis машины (пиявка сцеплена)
     constexpr uint8_t PercentStep = 1; // изменение процента меньше шага не рассылаем
 
     // Нужно ли слать: зажигание и свет — сразу при любом изменении, проценты — когда ушли на шаг и больше
     inline bool systems_changed(const SystemsBody& sent, const SystemsBody& now)
     {
         auto apart = [](uint8_t a, uint8_t b) { return (a > b ? a - b : b - a) >= PercentStep; };
-        return sent.Ignition != now.Ignition || sent.Lights != now.Lights || sent.Radio != now.Radio || apart(sent.Fuel, now.Fuel) || apart(sent.Battery, now.Battery);
+        return sent.Ignition != now.Ignition || sent.Lights != now.Lights || sent.Radio != now.Radio || sent.Wipers != now.Wipers || apart(sent.Fuel, now.Fuel) || apart(sent.Battery, now.Battery);
     }
 
     // Причуда = пара классов «условие → поведение» (SE_Quirk_MixAndMatch_C.QuirkCondition/QuirkBehavior): у Host и Client одинаковые,

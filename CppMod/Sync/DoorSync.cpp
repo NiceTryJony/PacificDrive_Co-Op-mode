@@ -3,6 +3,7 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
 
@@ -36,7 +37,7 @@ namespace DoorSync
             return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
         }
 
-        UObject* car_manager() { return UObjectGlobals::FindFirstOf(STR("BP_CarManager_C")); }
+        UObject* car_manager() { static Cached::First f{STR("BP_CarManager_C")}; return f.get(); } // опрос 10 Гц — без обхода всех объектов
 
         // Биты открытых дверей из игры; nullopt — менеджера машины нет (гараж, меню, загрузка)
         std::optional<uint8_t> read_doors()

@@ -11,7 +11,9 @@
 
 #include <cstring>
 #include <format>
+#include <map>
 #include <string>
+#include <unordered_map>
 
 // То же объявление, что в Windows.h (HMODULE = HINSTANCE__*) — без тяжёлого заголовка рядом с Unreal
 extern "C" __declspec(dllimport) struct HINSTANCE__* __stdcall GetModuleHandleW(const wchar_t* name);
@@ -91,19 +93,44 @@ namespace ItemProps
 
         // Свойства, разрешённые экземпляру (их же проверяет GetItemProperties). FindAllOf не годится: UItemProperties —
         // UScriptStruct, а UE4SS исключает такие из FindAllOf (тест 0.8.3)
+        // Имена структур и найденные поля — кэш: чтение идёт сотни раз за опрос (детали машины, багажник), а каждое сравнение
+        // строило строки из FName. Структуры IP_* — ассеты: держатся всю сессию; на случай выгрузки сверяем FName структуры
+        struct StructInfo
+        {
+            FName Name;
+            std::string Text;
+        };
+        std::unordered_map<UObject*, StructInfo> g_struct_names;
+        std::map<std::pair<UObject*, const Spec*>, std::pair<FName, FProperty*>> g_fields;
+
+        const std::string& struct_name_of(UObject* ps)
+        {
+            FName name = ps->GetNamePrivate();
+            auto& info = g_struct_names[ps];
+            if (info.Text.empty() || !info.Name.Equals(name)) info = {name, Items::narrow(ps->GetName())};
+            return info.Text;
+        }
+
         UObject* allowed_struct(UObject* instance, const char* struct_name)
         {
             auto* set = property<TSet<UObject*>>(instance, STR("AllowedProperties"));
             if (!set) return nullptr;
             for (UObject* ps : *set)
-                if (ps && Items::narrow(ps->GetName()) == struct_name) return ps;
+                if (ps && struct_name_of(ps) == struct_name) return ps;
             return nullptr;
         }
 
         FProperty* find_field(UObject* property_struct, const Spec& spec)
         {
+            FName name = property_struct->GetNamePrivate();
+            auto& cached = g_fields[{property_struct, &spec}];
+            if (cached.second && cached.first.Equals(name)) return cached.second;
             for (FProperty* p : TFieldRange<FProperty>(static_cast<UStruct*>(property_struct), EFieldIterationFlags::IncludeDeprecated))
-                if (clean_field_name(Items::narrow(p->GetName())) == spec.Field) return p;
+                if (clean_field_name(Items::narrow(p->GetName())) == spec.Field)
+                {
+                    cached = {name, p};
+                    return p;
+                }
             return nullptr;
         }
 

@@ -3,8 +3,10 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
+#include "Game/Cached.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
+#include "Sync/DriveProbe.h"
 
 #include <algorithm>
 #include <chrono>
@@ -37,7 +39,7 @@ namespace SystemsSync
             return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
         }
 
-        UObject* car_manager() { return UObjectGlobals::FindFirstOf(STR("BP_CarManager_C")); }
+        UObject* car_manager() { static Cached::First f{STR("BP_CarManager_C")}; return f.get(); }
 
         uint8_t percent(float current, float maximum)
         {
@@ -75,6 +77,8 @@ namespace SystemsSync
             out.Ignition = std::min<uint8_t>(*p_ignition, Coop::IgnitionMax);
             out.Lights = *p_lights ? 1 : 0;
             out.Radio = p_radio && *p_radio ? 1 : 0;
+            auto* wipers = property<bool>(manager, STR("WiperBladesOnOff"));
+            out.Wipers = wipers && *wipers ? 1 : 0;
             out.Fuel = percent(static_cast<float>(*p_fuel), static_cast<float>(*p_fuel_max));
             out.Battery = percent(*p_battery, *p_battery_max);
             return out;
@@ -85,6 +89,11 @@ namespace SystemsSync
         {
             auto* manager = car_manager();
             if (!manager) return false;
+            struct Suppress // эти вызовы — не действия Client-водителя, Host про них не спрашиваем (DriveAction)
+            {
+                Suppress() { DriveProbe::suppress_actions(true); }
+                ~Suppress() { DriveProbe::suppress_actions(false); }
+            } suppress;
             if (local.Ignition != want.Ignition)
             {
                 UFunctionCall fn(manager, STR("SetCarIgnitionState"));
@@ -118,7 +127,14 @@ namespace SystemsSync
                 }
                 else Output::send<LogLevel::Error>(STR("[SystemsSync] нет SetCarRadioOnOffState/параметров\n"));
             }
-            return local.Ignition == want.Ignition && local.Lights == want.Lights && local.Radio == want.Radio;
+            if (local.Wipers != want.Wipers)
+            {
+                // Переменная менеджера щётки не двигает (проба 2026-11-18): их запускает ToggleWiperBlades машины, он же переключает переменную
+                UFunctionCall fn(Cached::car(), STR("ToggleWiperBlades"));
+                if (fn) fn.call();
+                else Output::send<LogLevel::Error>(STR("[SystemsSync] нет ToggleWiperBlades у машины\n"));
+            }
+            return local.Ignition == want.Ignition && local.Lights == want.Lights && local.Radio == want.Radio && local.Wipers == want.Wipers;
         }
     } // namespace
 
@@ -136,7 +152,8 @@ namespace SystemsSync
 
     void on_systems(const Coop::SystemsBody& body)
     {
-        Output::send<LogLevel::Verbose>(STR("[SystemsSync] получено: зажигание {}, свет {}, радио {}, топливо {}%, аккумулятор {}%\n"), body.Ignition, body.Lights, body.Radio, body.Fuel, body.Battery);
+        Output::send<LogLevel::Verbose>(STR("[SystemsSync] получено: зажигание {}, свет {}, радио {}, дворники {}, топливо {}%, аккумулятор {}%\n"), body.Ignition, body.Lights, body.Radio,
+                                        body.Wipers, body.Fuel, body.Battery);
         g_wanted = body;
         g_last = body;
         g_wanted->Ignition = std::min<uint8_t>(g_wanted->Ignition, Coop::IgnitionMax); // мусор из сети в игру не передаём
@@ -163,7 +180,7 @@ namespace SystemsSync
         {
             if (g_wanted && (apply_to_game(*g_wanted, *local) || ++g_attempts >= MaxApplyAttempts))
             {
-                if (g_attempts >= MaxApplyAttempts) Output::send<LogLevel::Warning>(STR("[SystemsSync] игра не приняла зажигание/свет/радио за {} опросов — оставляю как есть\n"), MaxApplyAttempts);
+                if (g_attempts >= MaxApplyAttempts) Output::send<LogLevel::Warning>(STR("[SystemsSync] игра не приняла зажигание/свет/радио/дворники за {} опросов — оставляю как есть\n"), MaxApplyAttempts);
                 g_wanted.reset();
             }
             return;
@@ -172,13 +189,14 @@ namespace SystemsSync
         bool changed = !g_sent || Coop::systems_changed(*g_sent, *local);
         if (!changed && !g_send_full) return;
         // Проценты одни (зажигание и свет те же) — не чаще раза в секунду; полное состояние и смена зажигания/света — сразу
-        bool urgent = g_send_full || !g_sent || g_sent->Ignition != local->Ignition || g_sent->Lights != local->Lights || g_sent->Radio != local->Radio;
+        bool urgent = g_send_full || !g_sent || g_sent->Ignition != local->Ignition || g_sent->Lights != local->Lights || g_sent->Radio != local->Radio || g_sent->Wipers != local->Wipers;
         if (!urgent && now - g_last_percent_ms < PercentMinIntervalMs) return;
         g_send_full = false;
         g_last_percent_ms = now;
         g_sent = local;
         g_last = local;
         Net::send_systems(*local);
-        Output::send<LogLevel::Verbose>(STR("[SystemsSync] отправлено: зажигание {}, свет {}, радио {}, топливо {}%, аккумулятор {}%\n"), local->Ignition, local->Lights, local->Radio, local->Fuel, local->Battery);
+        Output::send<LogLevel::Verbose>(STR("[SystemsSync] отправлено: зажигание {}, свет {}, радио {}, дворники {}, топливо {}%, аккумулятор {}%\n"), local->Ignition, local->Lights,
+                                        local->Radio, local->Wipers, local->Fuel, local->Battery);
     }
 } // namespace SystemsSync

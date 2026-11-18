@@ -12,7 +12,7 @@ namespace Diag
     void tick(bool is_host);                       // игровой поток
 
     // Замер времени tick() подсистем: раз в 10 с строка [Perf] в лог (среднее и максимум за кадр, мс)
-    constexpr int PerfCount = 16;
+    constexpr int PerfCount = 17;
     void perf_add(int index, double ms);
     void perf_report();
     template <class F> void perf(int index, F&& fn)

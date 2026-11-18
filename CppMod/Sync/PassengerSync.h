@@ -7,6 +7,9 @@
 namespace PassengerSync
 {
     extern std::atomic<bool> g_key_pressed; // Client: Ctrl+E — сесть/выйти (поток клавиш UE4SS → игровой поток)
+    extern std::atomic<bool> g_key_driver;  // Client: Ctrl+Q — сесть за руль (место 2), если client_drive=1; выход — Ctrl+E
+    bool driving();                         // Client: сидим на месте водителя
+    int host_passenger_seat();              // Host: где сидит пассажир (0 — задний левый, 1 — задний правый, SeatDriver), -1 — не сидит
     void on_seat(Coop::PacketId id, const Coop::SeatBody& body, bool is_host); // из сети (игровой поток)
     void on_map_loaded();
     void set_exit_side_cm(float cm); // из coop.ini (exit_side_cm): высадка сбоку на столько см от оси машины; 0 — штатная точка игры

@@ -42,17 +42,18 @@ namespace Diag
             catch (...) { return NAN; }
         }
 
+        // FindFirstOf обходит все объекты игры, а Diag спрашивает каждую секунду ([Perf] Diag пики 2,7 мс)
+        Cached::First g_effect_manager{STR("BP_StatusEffectManager_C")};
+
         // Установленные детали машины: тег слота → экземпляр
         std::map<std::string, UObject*> car_parts()
         {
             std::map<std::string, UObject*> out;
             auto* car = Cached::car();
             if (!car) return out;
-            std::vector<UObject*> comps;
-            UObjectGlobals::FindAllOf(STR("SlotSceneComponent"), comps);
-            for (auto* comp : comps)
+            // Список как у PartsSync: FindAllOf каждую секунду обходил все объекты игры ([Perf] Diag пики 2,7 мс)
+            for (auto* comp : Cached::car_slot_components(car))
             {
-                if (comp->GetOuterPrivate() != car) continue;
                 auto* tag = property<FName>(comp, STR("SlotName"));
                 auto** item_slot = property<UObject*>(comp, STR("ItemSlot"));
                 if (!tag || !item_slot || !*item_slot) continue;
@@ -99,7 +100,7 @@ namespace Diag
         // Причуды машины: BP_StatusEffectManager_C.CarQuirks — число и класс/владелец каждой
         std::string quirks_line()
         {
-            auto* manager = UObjectGlobals::FindFirstOf(STR("BP_StatusEffectManager_C"));
+            auto* manager = g_effect_manager.get();
             auto* quirks = manager ? property<Items::RawArray>(manager, STR("CarQuirks")) : nullptr;
             if (!quirks) return "no effect manager";
             std::string out = std::format("CarQuirks: {}", quirks->Data ? quirks->Num : 0);
@@ -124,16 +125,15 @@ namespace Diag
         // флаг AnchorRemoved). Пункт 10 теста: у кого из двоих основание пустеет, когда якорь берёт другой
         std::string anchors_line()
         {
-            std::vector<UObject*> actors;
-            UObjectGlobals::FindAllOf(STR("ItemWorldManifestation"), actors);
+            // Списки перечитываются не чаще раза в 5 с: строка диагностическая, а FindAllOf каждую секунду давал пики [Perf] Diag
+            static Cached::All manifestations{STR("ItemWorldManifestation")}, anchor_bases{STR("BP_Spawn_Anchor_Base_01_C")};
             int ground = 0;
-            for (auto* actor : actors)
+            for (auto* actor : manifestations.get(5000))
             {
                 auto** instance = property<UObject*>(actor, STR("Instance"));
                 if (instance && *instance && Items::archetype_path(*instance).find("Anchor") != std::string::npos) ++ground;
             }
-            std::vector<UObject*> bases;
-            UObjectGlobals::FindAllOf(STR("BP_Spawn_Anchor_Base_01_C"), bases); // базовый класс всех оснований (CXXHeaderDump: там AnchorRemoved)
+            auto bases = anchor_bases.get(5000); // базовый класс всех оснований (CXXHeaderDump: там AnchorRemoved)
             int full = 0, removed = 0;
             for (auto* base : bases)
             {
@@ -149,7 +149,8 @@ namespace Diag
         // Возвращает {строка без времени — для сравнения, накопленное время}
         std::pair<std::string, float> storm_state()
         {
-            auto* mgr = UObjectGlobals::FindFirstOf(STR("BP_StormManager_C"));
+            static Cached::First storm_manager{STR("BP_StormManager_C")};
+            auto* mgr = storm_manager.get();
             if (!mgr) return {"no storm manager", NAN};
             auto* tol = property<float>(mgr, STR("FinalInstabilityTollerance"));
             auto* before = property<float>(mgr, STR("TimeBeforeInstabilityStarts"));
@@ -170,7 +171,7 @@ namespace Diag
         // Ctrl+F6: каждая причуда целиком — чем отличаются 4 одинаковых SE_Quirk_MixAndMatch_C (какую снимать при синхронизации починки)
         void dump_quirks()
         {
-            auto* manager = UObjectGlobals::FindFirstOf(STR("BP_StatusEffectManager_C"));
+            auto* manager = g_effect_manager.get();
             auto* quirks = manager ? property<Items::RawArray>(manager, STR("CarQuirks")) : nullptr;
             for (int32_t i = 0; quirks && quirks->Data && i < quirks->Num && i < 8; ++i)
                 if (auto* q = quirks->Data[i]) Output::send<LogLevel::Verbose>(STR("[Diag] quirk #{}: {}\n"), i, Items::wide(ObjectDump::to_json(q).substr(0, 6000)));
@@ -181,6 +182,7 @@ namespace Diag
         {
             std::vector<UObject*> parts, containers;
             UObjectGlobals::FindAllOf(STR("BP_TemplatePart_TrunkContents_C"), parts);
+            UObjectGlobals::FindAllOf(STR("BP_TemplatePart_TruckBedContainer_C"), parts); // кузова грузовиков: разыгрывают предметы при открытии
             UObjectGlobals::FindAllOf(STR("ItemContainer"), containers);
             int index = 0;
             for (auto* part : parts)
@@ -191,8 +193,17 @@ namespace Diag
                 {
                     if (container->GetOuterPrivate() != *instance) continue;
                     int total = 0;
+                    StringType names; // состав по архетипам — сравнить с собеседником, совпадает ли розыгрыш
                     if (auto* slots = property<Items::RawArray>(container, STR("Slots")); slots && slots->Data)
-                        for (int32_t i = 0; i < slots->Num; ++i) total += Items::items_of(slots->Data[i]).Num;
+                        for (int32_t i = 0; i < slots->Num; ++i)
+                        {
+                            auto items = Items::items_of(slots->Data[i]);
+                            total += items.Num;
+                            for (int32_t k = 0; items.Data && k < items.Num; ++k)
+                                if (auto** arch = items.Data[k] ? property<UObject*>(items.Data[k], STR("Archetype")) : nullptr; arch && *arch)
+                                    names += STR(" ") + (*arch)->GetName();
+                        }
+                    auto* rolled = property<bool>(part, STR("RolledOnOpenItems")); // есть только у кузова грузовика
                     // имя актёра: по нему видно один и тот же багажник у Host и Client (порядок FindAllOf у них разный)
                     // машина-владелец (родитель актёра багажника) — её класс и позиция совпадают у Host и Client, это ключ багажника
                     struct Vec
@@ -206,9 +217,10 @@ namespace Diag
                     UFunctionCall loc(car, STR("K2_GetActorLocation"));
                     auto* pos = loc ? loc.param<Vec>(STR("ReturnValue")) : nullptr;
                     if (pos) loc.call();
-                    Output::send<LogLevel::Verbose>(STR("[Diag] донор #{} {}: {} предметов, машина {} @ {} {} {}\n"), ++index, part->GetName(), total,
+                    Output::send<LogLevel::Verbose>(STR("[Diag] донор #{} {}{}: {} предметов, машина {} @ {} {} {}:{}\n"), ++index, part->GetName(),
+                                                    rolled ? (*rolled ? STR(" [кузов, разыгран]") : STR(" [кузов, не разыгран]")) : STR(""), total,
                                                     car ? car->GetClassPrivate()->GetName() : StringType(STR("?")), pos ? std::lround(pos->X) : 0, pos ? std::lround(pos->Y) : 0,
-                                                    pos ? std::lround(pos->Z) : 0);
+                                                    pos ? std::lround(pos->Z) : 0, names);
                 }
             }
             Output::send<LogLevel::Verbose>(STR("[Diag] багажников доноров на карте: {}\n"), parts.size());
@@ -567,7 +579,7 @@ namespace Diag
         auto now = now_ms();
         if (g_perf_last_ms == 0) g_perf_last_ms = now;
         if (now - g_perf_last_ms < 10'000) return;
-        static const char* names[PerfCount] = {"Net", "Presence", "Car", "Passenger", "Loot", "Door", "Systems", "Garage", "Parts", "Trunk", "Diag", "PassSave", "Status", "Quirk", "Anchor", "Zone"};
+        static const char* names[PerfCount] = {"Net", "Presence", "Car", "Passenger", "Loot", "Door", "Systems", "Garage", "Parts", "Trunk", "Diag", "PassSave", "Status", "Quirk", "Anchor", "Zone", "HudFeed"};
         std::string line;
         double total = 0;
         for (int i = 0; i < PerfCount; ++i)

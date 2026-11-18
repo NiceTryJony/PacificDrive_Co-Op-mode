@@ -255,6 +255,9 @@ namespace GarageSync
                 g_seen[*tkey] = d.heading_open ? 1 : 0;
                 continue;
             }
+            // Передней дверью (выезд) управляет игра: BP_Director_GSS_GarageFrontDoor каждый тик ставит GSS_Garage_FrontDoorOpened
+            // по выбранному маршруту, а он есть только у Host — закрытие у Client не действие игрока (docs/recon/reference/route-selection.md)
+            if (d.actor->GetName().starts_with(STR("BP_GarageDoorFront"))) continue;
             auto reported = g_reported.find(*tkey);
             if (reported != g_reported.end() && reported->second == (d.heading_open ? 1 : 0)) continue;
             g_reported[*tkey] = d.heading_open ? 1 : 0;

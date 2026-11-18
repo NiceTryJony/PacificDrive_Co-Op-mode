@@ -28,6 +28,7 @@ using namespace RC::Unreal;
 namespace PassengerSync
 {
     std::atomic<bool> g_key_pressed{false};
+    std::atomic<bool> g_key_driver{false};
 
     namespace
     {
@@ -268,6 +269,7 @@ namespace PassengerSync
 
         bool highlight_allowed(UObject* highlight)
         {
+            if (g_seat == Coop::SeatDriver) return true; // за рулём нужны ключ, свет, дворники, коробка, способности — не фильтруем
             UObject* owner = highlight->GetOuterPrivate();
             if (!owner) return true; // не знаем, чей — не мешаем
             auto owner_class = owner->GetClassPrivate()->GetName();
@@ -562,7 +564,8 @@ namespace PassengerSync
             Vec d{world->X - pose.X, world->Y - pose.Y, world->Z - pose.Z};
             Vec driver{dot(d, a.X), dot(d, a.Y), dot(d, a.Z)};
             // Правое место отсчитывается от точки водителя, отражённой через ось машины (водитель слева, y<0)
-            const Vec& offset = seat == 1 ? g_seat_offset_right : g_seat_offset;
+            // Место 2 (водитель): сама точка водителя, по высоте — как у заднего левого; слева, поэтому door_threshold/выход — как у seat 0
+            const Vec offset = seat == Coop::SeatDriver ? Vec{0, 0, g_seat_offset.Z} : seat == 1 ? g_seat_offset_right : g_seat_offset;
             g_seat_local = {driver.X + offset.X, (seat == 1 ? -driver.Y : driver.Y) + offset.Y, driver.Z + offset.Z};
 
             Vec start = car_local(pose, actor_location(character));
@@ -583,8 +586,8 @@ namespace PassengerSync
             install_in_car_percent<1>();
             if (g_anim.active) step_anim(character);
             else follow_car(character);
-            Output::send<LogLevel::Verbose>(STR("[Passenger] сел на задний {}: водитель в осях машины ({:.0f}, {:.0f}, {:.0f}), место ({:.0f}, {:.0f}, {:.0f})\n"),
-                                            seat == 0 ? STR("левый") : STR("правый"), driver.X, driver.Y, driver.Z, g_seat_local.X, g_seat_local.Y, g_seat_local.Z);
+            Output::send<LogLevel::Verbose>(STR("[Passenger] сел на {}: водитель в осях машины ({:.0f}, {:.0f}, {:.0f}), место ({:.0f}, {:.0f}, {:.0f})\n"),
+                                            seat == Coop::SeatDriver ? STR("место водителя") : seat == 0 ? STR("задний левый") : STR("задний правый"), driver.X, driver.Y, driver.Z, g_seat_local.X, g_seat_local.Y, g_seat_local.Z);
         }
 
         void stand_up(const wchar_t* reason)
@@ -642,7 +645,7 @@ namespace PassengerSync
             Output::send<LogLevel::Verbose>(STR("[Passenger] вышел из машины ({})\n"), reason);
         }
 
-        void on_key()
+        void on_key(bool driver)
         {
             if (g_seat >= 0)
             {
@@ -682,6 +685,12 @@ namespace PassengerSync
                 Axes ax = axes(pose.Pitch, pose.Yaw, pose.Roll);
                 preferred = dot({b.X - pose.X, b.Y - pose.Y, b.Z - pose.Z}, ax.Y) < 0 ? 0 : 1;
             }
+            if (driver) // за руль: стороны и модуль на сиденье не проверяем, водительское место решает Host (его персонаж не должен сидеть в машине)
+            {
+                Net::send_seat(Coop::RequestSeat, {Coop::SeatDriver, 0});
+                Output::send<LogLevel::Verbose>(STR("[Passenger] прошу место водителя\n"));
+                return;
+            }
             int seat = preferred;
             if (!seat_free(car, seat))
             {
@@ -706,7 +715,13 @@ namespace PassengerSync
             if (id != Coop::RequestSeat) return;
             UObject* car = Cached::car();
             Coop::SeatBody reply{request.Seat, Coop::SeatNoCar};
-            if (car)
+            if (car && request.Seat == Coop::SeatDriver)
+            {
+                // Водительское место: свободно, если персонаж Host не в машине (тот же признак, что в Presence: PercentInCar)
+                auto* host_in_car = property<float>(Cached::character(), STR("PercentInCar"));
+                reply = {Coop::SeatDriver, host_in_car && *host_in_car > 0.5f ? Coop::SeatDriverBusy : Coop::SeatOk};
+            }
+            else if (car)
             {
                 // Только та сторона, с которой подошёл пассажир (решение пользователя 2026-11-06): модуль на сиденье — отказ;
                 // дверь снята — можно, открывать не нужно; дверь есть — должна быть открыта
@@ -729,9 +744,12 @@ namespace PassengerSync
             }
             Net::send_seat(Coop::PassengerAttach, reply);
             if (reply.Result == Coop::SeatOk) g_host_passenger = reply.Seat;
-            Output::send<LogLevel::Verbose>(STR("[Passenger] запрос посадки → {}\n"), reply.Result == Coop::SeatOk ? STR("разрешено") : reply.Result == Coop::SeatNoCar ? STR("нет машины") : reply.Result == Coop::SeatDoorClosed ? STR("задняя дверь закрыта") : STR("оба места заняты модулями"));
+            Output::send<LogLevel::Verbose>(STR("[Passenger] запрос посадки → {}\n"), reply.Result == Coop::SeatOk ? STR("разрешено") : reply.Result == Coop::SeatNoCar ? STR("нет машины") : reply.Result == Coop::SeatDoorClosed ? STR("задняя дверь закрыта") : reply.Result == Coop::SeatDriverBusy ? STR("водитель сидит в машине") : STR("оба места заняты модулями"));
         }
     } // namespace
+
+    bool driving() { return g_seat == Coop::SeatDriver; }
+    int host_passenger_seat() { return g_host_passenger; }
 
     void set_restrict_interactions(bool on) { g_restrict = on; }
 
@@ -755,8 +773,8 @@ namespace PassengerSync
             if (body.Result == Coop::SeatOk) sit(body.Seat);
             else
             {
-                Output::send<LogLevel::Verbose>(STR("[Passenger] Host отказал: {}\n"), body.Result == Coop::SeatNoCar ? STR("у него нет машины") : body.Result == Coop::SeatDoorClosed ? STR("задняя дверь закрыта") : STR("задние места заняты модулями — освободите слот"));
-                Notify::push(Notify::Kind::Warn, body.Result == Coop::SeatDoorClosed ? "Open the door first" : body.Result == Coop::SeatNoCar ? "The driver has no car right now" : "The rear seats are taken by car parts");
+                Output::send<LogLevel::Verbose>(STR("[Passenger] Host отказал: {}\n"), body.Result == Coop::SeatNoCar ? STR("у него нет машины") : body.Result == Coop::SeatDoorClosed ? STR("задняя дверь закрыта") : body.Result == Coop::SeatDriverBusy ? STR("Host сидит за рулём") : STR("задние места заняты модулями — освободите слот"));
+                Notify::push(Notify::Kind::Warn, body.Result == Coop::SeatDoorClosed ? "Open the door first" : body.Result == Coop::SeatNoCar ? "The driver has no car right now" : body.Result == Coop::SeatDriverBusy ? "The host is in the driver's seat" : "The rear seats are taken by car parts");
             }
         }
         else if (id == Coop::PassengerDetach && g_seat >= 0)
@@ -818,6 +836,7 @@ namespace PassengerSync
         if (is_host)
         {
             g_key_pressed = false; // водитель садится штатно
+            g_key_driver = false;
             return;
         }
         static bool saved_loaded = false;
@@ -826,7 +845,8 @@ namespace PassengerSync
             saved_loaded = true;
             g_resume_seat = load_saved_seat();
         }
-        if (g_key_pressed.exchange(false) && Net::connected()) on_key();
+        bool key = g_key_pressed.exchange(false), key_driver = g_key_driver.exchange(false);
+        if ((key || key_driver) && Net::connected()) on_key(key_driver && !key);
         if (g_seat >= 0)
         {
             if (!Net::connected() || !CarSync::puppet_car())

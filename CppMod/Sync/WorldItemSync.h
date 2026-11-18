@@ -11,4 +11,7 @@ namespace WorldItemSync
     void tick(bool is_host);
     void on_map_loaded();
     void on_world_item(const Coop::WorldItemBody& body, const std::string& path, const std::vector<Coop::TrunkValue>& values);
+    // Создать предмет архетипа path и поставить его в мир (SpawnItemInstanceActor, контекст World); хук не пересылает его собеседнику.
+    // Возвращает экземпляр (UItemInstance*), nullptr — не вышло. Нужны UE4SS-заголовки у вызывающего — тип void*, чтобы .h их не тянул
+    void* spawn_in_world(const std::string& path, const float transform[12], uint8_t create_context);
 } // namespace WorldItemSync

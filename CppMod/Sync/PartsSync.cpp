@@ -248,6 +248,11 @@ namespace PartsSync
         std::map<std::string, int> g_levels_attempts;
         std::set<std::string> g_levels_seen;                   // Client: «больше, чем у Host» замечено прошлым опросом
         std::map<std::string, std::string> g_levels_reported;  // Client: какие уровни уже отправлены Host-у
+        // Client: когда последний раз просил Host о здоровье/уровнях детали. Заправка и ремонт замазкой растут постепенно, ответ Host-а
+        // отстаёт — не тянем деталь вниз к нему (тест 2026-11-17 21:12: бак тянули, сдались за 3 попытки и забыли слово Host-а —
+        // запросы прекратились; 2026-11-16 07:36: колесо при ремонте переписывали вниз)
+        std::map<std::string, uint64_t> g_asked_ms;
+        constexpr uint64_t AskedHoldMs = 3000;
 
         // Здоровье деталей (docs/sync/SYNC_PLAN.md, правило 3). Host шлёт при смене слота и при изменении ≥ health_step; Client подтягивается
         // к Host-у, а если у него стало больше (Repair Putty, установка починенной детали) — просит Host. Урон Client не получает:
@@ -273,6 +278,12 @@ namespace PartsSync
             return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
         }
 
+        bool asked_recently(const std::string& tag)
+        {
+            auto it = g_asked_ms.find(tag);
+            return it != g_asked_ms.end() && now_ms() - it->second < AskedHoldMs;
+        }
+
         bool synced(const std::string& tag)
         {
             for (auto* prefix : SyncedPrefixes)
@@ -281,12 +292,14 @@ namespace PartsSync
         }
 
         // Компоненты краски по актёрам-владельцам: на видимой детали он один
-        std::map<UObject*, UObject*> tint_components_by_actor()
+        // Список компонентов краски держим до TintMaxAgeMs: FindAllOf обходит все объекты игры, а опрос идёт каждые 60–300 мс
+        constexpr uint64_t TintMaxAgeMs = 2000;
+        Cached::All g_tints{STR("BP_TintableComponent_C")};
+
+        std::map<UObject*, UObject*> tint_components_by_actor(uint64_t max_age_ms)
         {
-            std::vector<UObject*> comps;
-            UObjectGlobals::FindAllOf(STR("BP_TintableComponent_C"), comps);
             std::map<UObject*, UObject*> out;
-            for (auto* comp : comps)
+            for (auto* comp : g_tints.get(max_age_ms))
                 if (comp) out[comp->GetOuterPrivate()] = comp;
             return out;
         }
@@ -322,14 +335,12 @@ namespace PartsSync
         // и Client может разниться, и слот попал бы не в тот
         std::map<std::string, Slot> read_slots(UObject* car)
         {
-            std::vector<UObject*> comps;
-            UObjectGlobals::FindAllOf(STR("SlotSceneComponent"), comps);
             std::map<std::string, Slot> slots;
             std::set<std::string> twice;
-            auto tint_components = tint_components_by_actor();
-            for (auto* comp : comps)
+            auto tint_components = tint_components_by_actor(TintMaxAgeMs);
+            bool tints_refreshed = false;
+            for (auto* comp : Cached::car_slot_components(car))
             {
-                if (comp->GetOuterPrivate() != car) continue;
                 auto* tag_name = property<FName>(comp, STR("SlotName")); // FGameplayTag = одно FName TagName
                 auto** item_slot = property<UObject*>(comp, STR("ItemSlot"));
                 if (!tag_name || !item_slot || !*item_slot) continue;
@@ -340,7 +351,15 @@ namespace PartsSync
                 if (auto** actor = property<UObject*>(comp, STR("SpawnedActor")); actor && *actor)
                 {
                     slot.actor = *actor;
-                    if (auto it = tint_components.find(*actor); it != tint_components.end()) slot.tint = read_tint(it->second);
+                    auto it = tint_components.find(*actor);
+                    // Деталь новее списка компонентов краски — перечитать один раз за опрос (как раньше каждый опрос), но не чаще PollMs
+                    if (it == tint_components.end() && !tints_refreshed && g_tints.age_ms() >= PollMs)
+                    {
+                        tints_refreshed = true;
+                        tint_components = tint_components_by_actor(0);
+                        it = tint_components.find(*actor);
+                    }
+                    if (it != tint_components.end()) slot.tint = read_tint(it->second);
                 }
                 if (auto items = Items::items_of(*item_slot); items.Num > 0 && items.Data[0])
                 {
@@ -379,18 +398,20 @@ namespace PartsSync
                 Output::send<LogLevel::Verbose>(STR("[PartsSync] {}: эффекты → {}{}\n"), wide(tag), wanted_effects.size(), ok ? STR("") : STR(" (не все применились)"));
                 return ok;
             }
-            if (slot.instance) Items::remove(slot.instance);
             if (wanted.empty())
             {
+                if (slot.instance) Items::remove(slot.instance);
                 Output::send<LogLevel::Verbose>(STR("[PartsSync] {}: деталь снята\n"), wide(tag));
                 return true;
             }
+            // Сначала новая, потом снимаем старую: не создалась — старая деталь остаётся (раньше слот пустел, у Host — по запросу Client)
             auto* instance = Items::create(car, wanted, context);
             if (!instance)
             {
-                Output::send<LogLevel::Warning>(STR("[PartsSync] {}: не создать {} (архетип не загружен или CreateItemInstance не сработал) — слот пуст\n"), wide(tag), wide(wanted));
+                Output::send<LogLevel::Warning>(STR("[PartsSync] {}: не создать {} (архетип не загружен или CreateItemInstance не сработал) — деталь не меняю\n"), wide(tag), wide(wanted));
                 return false;
             }
+            if (slot.instance) Items::remove(slot.instance);
             if (!Items::add_to_slot(slot.item_slot, instance))
             {
                 Output::send<LogLevel::Error>(STR("[PartsSync] нет ItemSlot.AddItem/Item\n"));
@@ -453,7 +474,7 @@ namespace PartsSync
         // Применить присланную краску деталям, которые уже стоят (пока слот ещё меняется — ждём). Совпадение проверяет следующий опрос
         void apply_tint(const std::map<std::string, Slot>& slots, bool is_host)
         {
-            auto tint_components = tint_components_by_actor();
+            auto tint_components = tint_components_by_actor(TintMaxAgeMs); // read_slots этого опроса уже перечитал список, если деталь новая
             for (auto it = g_tint_wanted.begin(); it != g_tint_wanted.end();)
             {
                 const auto& [tag, want] = *it;
@@ -560,7 +581,10 @@ namespace PartsSync
         if (auto levels = parse_levels(levels_str); !levels.empty())
         {
             g_known_levels[tag] = levels;
-            g_levels_wanted[tag] = {archetype_of(path), levels, false, false};
+            if (asked_recently(tag))
+                g_levels_wanted.erase(tag); // ответ на наш запрос в пути — свой рост перешлём следующим опросом
+            else
+                g_levels_wanted[tag] = {archetype_of(path), levels, false, false};
         }
         else
         {
@@ -589,7 +613,8 @@ namespace PartsSync
         if (float health = to_float(health_text); !std::isnan(health))
         {
             g_known_health[tag] = health;
-            g_health_wanted[tag] = {archetype_of(path), health, false, false};
+            if (asked_recently(tag)) g_health_wanted.erase(tag); // как с уровнями: ремонт идёт, ответ отстаёт
+            else g_health_wanted[tag] = {archetype_of(path), health, false, false};
         }
         else
         {
@@ -838,6 +863,7 @@ namespace PartsSync
             if (auto reported = g_health_reported.find(tag); reported != g_health_reported.end() && reported->second == slot.health) continue;
             if (!Net::send_part(tag, wire_of(slot), Coop::CarPartRequest)) continue;
             g_health_reported[tag] = slot.health;
+            g_asked_ms[tag] = now_ms();
             Output::send<LogLevel::Verbose>(STR("[PartsSync] {}: деталь починена игроком (здоровье {} → {}) → прошу Host\n"), wide(tag), host, mine);
         }
 
@@ -874,6 +900,7 @@ namespace PartsSync
             if (auto reported = g_levels_reported.find(tag); reported != g_levels_reported.end() && reported->second == text) continue;
             if (!Net::send_part(tag, wire_of(slot), Coop::CarPartRequest)) continue;
             g_levels_reported[tag] = text;
+            g_asked_ms[tag] = now_ms();
             Output::send<LogLevel::Verbose>(STR("[PartsSync] {}: топливо/заряд выросли у игрока ({}) → прошу Host\n"), wide(tag), wide(text));
         }
 

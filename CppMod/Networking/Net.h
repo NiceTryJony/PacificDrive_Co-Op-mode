@@ -42,6 +42,12 @@ namespace Net
         float sim_loss_percent = 0;
         // Тест на одном ПК: HeapGuard ведёт себя как у Client, даже если игра — Host (coop.ini: heap_test=1)
         bool heap_test = false;
+        // Client, сидя в машине, шлёт Host-у свой газ и руль (DriveInput) — Host ведёт машину по ним. По умолчанию выключено (coop.ini: client_drive=1)
+        bool client_drive = false;
+        // Предмет в руке собеседника: показывать его работу (насадки, пламя, плазма, вращение), а не только корпус (coop.ini: hand_fx=0 — только модель)
+        bool hand_fx = true;
+        // Разведка 4б (DriveProbe): подмена оси газа/руля у машины Host; оба 0 — выключено (coop.ini: drive_probe_throttle, drive_probe_steer)
+        float drive_probe_throttle = 0, drive_probe_steer = 0;
     };
 
     struct Events
@@ -68,7 +74,8 @@ namespace Net
         std::function<void(const Coop::WorldItemBody&, const std::string&, const std::vector<Coop::TrunkValue>&)> on_world_item; // собеседник положил предмет на землю
         std::function<void(const std::string&, const std::string&)> on_radio; // Client: текущий трек радио Host (вид, имя)
         std::function<void(const std::string&, const std::string&)> on_weather; // Client: погода Host-а — тег "wev" + путь класса WEV_* / "lvl" + уровни
-        std::function<void(const std::string&, const std::string&)> on_gate; // оба: ворота выезда гаража у собеседника (тег "gate", "1"/"0")
+        std::function<void(const std::string&, const std::string&)> on_gate; // Client: раскрытые отрезки маршрута у Host (тег "legs")
+        std::function<void(const std::string&, const std::string&)> on_hand; // оба: предмет в руке собеседника (тег "hand", путь меша)
         std::function<void(Coop::PacketId, const Coop::AnchorBody&)> on_anchor; // AnchorTaken — якорь взял собеседник, PortalActive — активировал портал
         std::function<void(const std::string&, const std::string&)> on_census; // оба: срез зоны собеседника (карта, «Класс=число …»)
         std::function<void(const std::string&, const std::string&)> on_hazard; // Client: аномалия Host-а от якоря (позиция и поворот текстом, путь класса)

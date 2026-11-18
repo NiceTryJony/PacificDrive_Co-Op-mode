@@ -1,5 +1,7 @@
 // Предметы игры из мода (игровой поток): создать, удалить, путь архетипа. Общие для деталей и багажника машины (RECON.md «6.10», «6.11»).
 #pragma once
+#include <Unreal/UAssetRegistry.hpp>
+#include <Unreal/UAssetRegistryHelpers.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 
 #include "Game/UFunctionCall.h"
@@ -96,11 +98,26 @@ namespace Items
         }
     }
 
-    // nullptr — архетип не загружен или вызов не прошёл. context — как у соседних предметов (значения enum в дампе обфусцированы)
+    // Объект по полному пути; не загружен — грузит пакет через реестр ассетов, как LoadAsset в Lua UE4SS (блокирующе, ~150 мс;
+    // проверено 2026-11-17 на GEV_WindSquall). Класс блюпринта «…/X.X_C» лежит в реестре как «…/X.X». nullptr — нет такого ассета
+    inline UObject* find_or_load(const std::string& path)
+    {
+        StringType wpath = wide(path);
+        if (auto* found = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, wpath)) return found;
+        auto* registry = static_cast<UAssetRegistry*>(UAssetRegistryHelpers::GetAssetRegistry().ObjectPointer);
+        if (!registry) return nullptr;
+        StringType asset = wpath.ends_with(STR("_C")) ? wpath.substr(0, wpath.size() - 2) : wpath;
+        FAssetData data = registry->GetAssetByObjectPath(FName(asset, FNAME_Add));
+        if (!data.PackageName().GetComparisonIndex()) return nullptr;
+        UAssetRegistryHelpers::GetAsset(data);
+        return UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, wpath);
+    }
+
+    // nullptr — архетипа нет или вызов не прошёл. context — как у соседних предметов (значения enum в дампе обфусцированы)
     inline UObject* create(UObject* world_context, const std::string& archetype_path, uint8_t context)
     {
-        auto* archetype = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, wide(archetype_path).c_str());
-        if (!archetype) return nullptr; // shortcut: не грузим ассет (StaticLoadObject) — у Client архетипы из сейва Host уже в памяти
+        auto* archetype = find_or_load(archetype_path);
+        if (!archetype) return nullptr;
         static auto* lib = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/PenDriverInventory.Default__InventoryBlueprintLibrary"));
         UFunctionCall fn(lib, STR("CreateItemInstance"));
         auto* p_world = fn ? fn.param<UObject*>(STR("WorldContextObject")) : nullptr;

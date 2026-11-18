@@ -92,7 +92,19 @@ namespace AnchorSync
                     ++removed;
                 }
             }
-            Output::send<LogLevel::Verbose>(STR("[Anchor] у основания убрано компонентов: {} из {}\n"), removed, std::size(Parts));
+            // Из AnchorTaken() (байткод BP_Spawn_Anchor_Base_01, 2026-11-18) без возмущения зоны: объём радиации вокруг якоря
+            // (RadActor, BP_VolCascade_Radiation — иначе у собеседника радиация у пустой вилки остаётся) и тег «радар якорей не видит»
+            bool rad = false;
+            if (auto** rad_actor = property<UObject*>(base, STR("RadActor")); rad_actor && *rad_actor)
+            {
+                UFunctionCall destroy(*rad_actor, STR("K2_DestroyActor"));
+                if ((rad = static_cast<bool>(destroy))) destroy.call();
+                *rad_actor = nullptr;
+            }
+            UFunctionCall tag(base, STR("AddAnchorPulledTag"));
+            if (tag) tag.call();
+            Output::send<LogLevel::Verbose>(STR("[Anchor] у основания убрано компонентов: {} из {}, радиация {}, тег радара {}\n"), removed, std::size(Parts),
+                                            rad ? STR("убрана") : STR("нет"), tag ? STR("поставлен") : STR("НЕТ функции"));
             g_taken[base] = true; // не принять за своё взятие
             if (!g_is_host) return;
             // Host решает за зону: «возмущение» от взятия якоря (аномалии) — как если бы взял он сам.
@@ -200,6 +212,78 @@ namespace AnchorSync
                 Output::send<LogLevel::Verbose>(STR("[Portal] я активировал портал → сообщаю собеседнику\n"));
             }
         }
+        // Плазменный генератор (docs/recon/reference/gameplay-events.md): ломается при появлении — RandomState (у каждого ПК свои сиды) против
+        // ChanceToBreakOnSpawn — и всегда при сборе плазмы (OnHarvested). Кто увидел новый сломанный — шлёт позицию (GeneratorBroken),
+        // второй ломает свой: Broken = true + BeginPlay_FromLoad (ветка «сломан» из сейва: модель, свет, подсветка, звук, свойства предмета —
+        // проверено через мост 2026-11-17). Client сам при появлении не ломает (шанс 0 до BeginPlay) — поломки при появлении решает Host
+        constexpr uint64_t GeneratorPollMs = 2000;
+        uint64_t g_gen_poll_ms = 0;
+        std::map<UObject*, bool> g_gen_broken;         // генератор → сломан на прошлом опросе
+        std::vector<Coop::AnchorBody> g_gen_wanted;    // присланные поломки, генератора ещё нет (Client получает зону раньше, чем доспавнит)
+
+        bool is_generator(UObject* actor) { return actor->GetClassPrivate()->GetName() == STR("BP_Spawn_Resource_Plasma_PlasmaGenerator_C"); }
+
+        std::vector<UObject*> generators()
+        {
+            std::vector<UObject*> out;
+            UObjectGlobals::FindAllOf(STR("BP_Spawn_Resource_Plasma_PlasmaGenerator_C"), out);
+            return out;
+        }
+
+        bool generator_broken(UObject* g)
+        {
+            auto* broken = property<bool>(g, STR("Broken"));
+            return broken && *broken;
+        }
+
+        void break_generator(UObject* g)
+        {
+            g_gen_broken[g] = true; // не принять за свою поломку
+            if (auto* broken = property<bool>(g, STR("Broken"))) *broken = true;
+            UFunctionCall show(g, STR("BeginPlay_FromLoad"));
+            if (show) show.call();
+            Vec p = location(g);
+            Output::send<LogLevel::Verbose>(STR("[Generator] генератор у ({:.0f}, {:.0f}, {:.0f}) сломан у собеседника → ломаю у себя: {}\n"), static_cast<double>(p.X),
+                                            static_cast<double>(p.Y), static_cast<double>(p.Z), show ? STR("готово") : STR("нет BeginPlay_FromLoad"));
+        }
+
+        void tick_generators(bool settled, uint64_t now)
+        {
+            if (!Net::connected())
+            {
+                g_gen_broken.clear(); // после подключения Host перешлёт все сломанные заново
+                return;
+            }
+            if (now - g_gen_poll_ms < GeneratorPollMs) return;
+            g_gen_poll_ms = now;
+            std::vector<UObject*> all = generators();
+            for (size_t i = 0; i < g_gen_wanted.size();)
+            {
+                UObject* g = nearest(all, g_gen_wanted[i]);
+                if (!g)
+                {
+                    ++i;
+                    continue;
+                }
+                if (!generator_broken(g)) break_generator(g);
+                g_gen_wanted.erase(g_gen_wanted.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+            if (!settled) return;
+            for (UObject* g : all)
+            {
+                bool broken = generator_broken(g);
+                bool& was = g_gen_broken[g]; // новый в учёте — false: сломанный при появлении тоже уходит собеседнику
+                if (!broken || was) continue;
+                was = true;
+                Vec p = location(g);
+                if (std::isnan(p.X)) continue;
+                Net::send_anchor({static_cast<int32_t>(std::lround(p.X)), static_cast<int32_t>(std::lround(p.Y)), static_cast<int32_t>(std::lround(p.Z))},
+                                 Coop::GeneratorBroken);
+                Output::send<LogLevel::Verbose>(STR("[Generator] генератор у ({:.0f}, {:.0f}, {:.0f}) сломан → сообщаю собеседнику\n"), static_cast<double>(p.X),
+                                                static_cast<double>(p.Y), static_cast<double>(p.Z));
+            }
+        }
+
         // Аномалии от взятия якоря: у каждого ПК свой BP_HazardAnchorPull_C спавнит случайный набор (тесты 0.17.6/0.17.7):
         // Bollard_AnchorPull, Movement_Prong_AnchorSpawn и радиационные пятна RadiatedZone_SpawnEvent (TryRadSpotSpawn).
         // Перехват GetNextSpawnLocation не годится (0.17.7: позиция читалась нулём, функция зовётся по нескольку раз на одну аномалию) —
@@ -209,7 +293,7 @@ namespace AnchorSync
         {
             float Pitch, Yaw, Roll;
         };
-        Hook::GlobalCallbackId g_begin_play{};
+        Hook::GlobalCallbackId g_begin_play{}, g_begin_play_pre{};
         bool g_spawning = false; // Client: идёт наш спавн присланной аномалии — её не убирать
         // Идёт LoadMap: BeginPlay актёров из сейва приходит раньше, чем on_map_loaded обновит g_loaded_ms, — по старой отметке
         // «карта давно загружена», и Client убирал аномалию из сейва Host (тест 2026-11-10 07:26:04, пузырь пиявки)
@@ -224,8 +308,9 @@ namespace AnchorSync
                    cls == STR("BP_Hazard_Movement_Prong_C") ||
                    // шторм и портал выхода (экран гоблера создаёт их только у выбравшего выход, тест 0.17.9 19:29)
                    cls == STR("BP_ExitPortalSpawn_C") || cls == STR("BP_ZoneStormRoyale_C") ||
-                   // события директора (тест 0.17.9 19:20–19:24: только у Host); сами пиявки не шлём — их порождает пузырь
-                   cls == STR("BP_LocationalEvent_C") || cls.find(STR("BP_Hazard_SpawnBubble_Leech_")) == 0;
+                   // пузыри пиявок; сами пиявки не шлём — их порождает пузырь. Зону события директора BP_LocationalEvent_C не шлём:
+                   // её создаёт само событие GEV, а событие Host-а Client повторяет целиком (WeatherSync, [Gev])
+                   cls.find(STR("BP_Hazard_SpawnBubble_Leech_")) == 0;
         }
 
         Rot rotation(UObject* actor)
@@ -319,9 +404,8 @@ namespace AnchorSync
                                             p_loc && p_timer && p_gate ? STR("вызван") : STR("НЕ НАЙДЕН (менеджер/параметры)"));
             return;
         }
-        StringType wpath(class_path.begin(), class_path.end());
-        // shortcut: только уже загруженный класс (без StaticLoadObject) — пул аномалий якоря грузит свой BP_HazardAnchorPull_C; грузить, если в логе «НЕ ЗАГРУЖЕН»
-        auto* cls = UObjectGlobals::StaticFindObject<UClass*>(nullptr, nullptr, wpath);
+        // класс может быть ещё не загружен (тест: «класс НЕ ЗАГРУЖЕН» — аномалия пришла до загрузки зоны у Client) — грузим из реестра
+        auto* cls = static_cast<UClass*>(Items::find_or_load(class_path));
         UObject* ctx = UObjectGlobals::FindFirstOf(STR("BP_HazardAnchorPull_C"));
         if (!ctx) ctx = UObjectGlobals::FindFirstOf(STR("BP_StormManager_C")); // шторм/портал: любой живой объект мира как контекст
         auto* statics = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Engine.Default__GameplayStatics"));
@@ -367,6 +451,21 @@ namespace AnchorSync
         g_begin_play = Hook::RegisterBeginPlayPostCallback([](Hook::TCallbackIterationData<void>&, AActor* actor) { on_begin_play(actor); },
                                                            {false, false, STR("PacificDriveCoop"), STR("AnchorHazards")});
         Output::send<LogLevel::Verbose>(STR("[Hazard] перехват появления аномалий {}\n"), g_begin_play ? STR("установлен") : STR("НЕ УСТАНОВЛЕН"));
+        // Client: генератор не ломается сам при появлении. Шанс < 0 — DeterminePlasmaBreakChance считает его по карте, 0 — пропускает,
+        // а «случайное < 0» не бывает (байткод BeginPlay, 2026-11-17).
+        // FTuningFloat (CXXHeaderDump/PenDriverUtils.hpp): 0x0 bool bOverride_TuningFloat, 0x4 FGameplayTag TuningTag, 0xC float TuningFloat
+        g_begin_play_pre = Hook::RegisterBeginPlayPreCallback(
+                [](Hook::TCallbackIterationData<void>&, AActor* actor) {
+                    if (!actor || g_is_host || !Net::connected() || !is_generator(actor)) return;
+                    // Заданный тег побеждает значение даже при bOverride_TuningFloat = true (мост 2026-11-17: тег леса → 0,75 при значении 0,25),
+                    // поэтому тег — None (FName {0,0}), значение 0. Без тега Conv_TuningFloatToFloat отдаёт значение (на этом держится «шанс < 0» в игре)
+                    if (auto* chance = property<uint8_t>(actor, STR("ChanceToBreakOnSpawn")))
+                    {
+                        std::memset(chance + 0x4, 0, 8);
+                        *reinterpret_cast<float*>(chance + 0xC) = 0.0f;
+                    }
+                },
+                {false, false, STR("PacificDriveCoop"), STR("GeneratorNoBreak")});
     }
 
     void on_map_loading() { g_loading = true; }
@@ -378,11 +477,22 @@ namespace AnchorSync
         g_taken.clear();
         g_portal.clear();
         g_portal_echo.clear();
+        g_gen_broken.clear();
+        g_gen_wanted.clear();
     }
 
     void on_anchor(Coop::PacketId id, const Coop::AnchorBody& body)
     {
         if (id == Coop::PortalActive) return on_portal(body);
+        if (id == Coop::GeneratorBroken)
+        {
+            if (UObject* g = nearest(generators(), body); g)
+            {
+                if (!generator_broken(g)) break_generator(g);
+            }
+            else g_gen_wanted.push_back(body); // ещё не появился — сломаем на опросе, когда появится
+            return;
+        }
         UObject* best = nearest(bases(), body);
         if (!best)
         {
@@ -408,6 +518,7 @@ namespace AnchorSync
         g_last_poll_ms = now;
         bool settled = now - g_loaded_ms >= SettleMs;
         tick_portals(settled);
+        tick_generators(settled, now);
         for (auto* base : bases())
         {
             bool now_taken = taken(base);

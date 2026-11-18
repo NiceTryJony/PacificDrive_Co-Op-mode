@@ -274,23 +274,24 @@ namespace WorldItemSync
             std::string path = Items::archetype_path(instance);
             g_sent.insert(instance);
             g_pending.erase(g_pending.begin() + static_cast<std::ptrdiff_t>(i));
+            if (path.find("IA_Hazard_Leech") != std::string::npos) continue; // пиявки ведёт LeechSync (рождаются тем же SpawnItemInstanceActor)
             if (!path.empty() && Net::send_world_item(body, path, values_of(instance)))
                 Output::send<LogLevel::Verbose>(STR("[WorldItem] отправлен: {} — лёг в ({:.0f}, {:.0f}, {:.0f})\n"), Items::wide(path), body.Transform[4], body.Transform[5],
                                                 body.Transform[6]);
         }
     }
 
-    void on_world_item(const Coop::WorldItemBody& body, const std::string& path, const std::vector<Coop::TrunkValue>& values)
+    void* spawn_in_world(const std::string& path, const float transform[12], uint8_t create_context)
     {
         UObject* player = character();
         UObject* inventory = inventory_system();
         if (!player || !inventory)
         {
-            Output::send<LogLevel::Warning>(STR("[WorldItem] получен {}, но нет игрока/InventorySystem — пропущен\n"), Items::wide(path));
-            return;
+            Output::send<LogLevel::Warning>(STR("[WorldItem] {}: нет игрока/InventorySystem — не создан\n"), Items::wide(path));
+            return nullptr;
         }
         g_applying = true; // создание от сети хук не пересылает обратно
-        UObject* instance = Items::create(player, path, body.CreateContext);
+        UObject* instance = Items::create(player, path, create_context);
         if (instance)
         {
             preload_world_class(instance);
@@ -302,26 +303,37 @@ namespace WorldItemSync
             if (p_world && p_tf && p_instance && p_context)
             {
                 *p_world = player;
-                std::memcpy(p_tf->Data, body.Transform, sizeof(p_tf->Data));
+                std::memcpy(p_tf->Data, transform, sizeof(p_tf->Data));
                 *p_instance = instance;
                 *p_context = 0; // World
                 spawn.call();
-                // Есть ли у экземпляра проявление (актёр) в мире? Без него предмета не видно (жалоба пользователя 2026-11-07)
-                UObject* actor = manifestation_of(instance);
-                g_checks.push_back({FWeakObjectPtr(instance), now_ms()});
-                Output::send<LogLevel::Verbose>(STR("[WorldItem] проявление: {}\n"), actor ? actor->GetFullName() : StringType(STR("НЕТ")));
-                for (const auto& v : values)
-                {
-                    auto text = text_of(v);
-                    if (text.empty() || !ItemProps::write(instance, ItemProps::Specs[v.Spec], text))
-                        Output::send<LogLevel::Warning>(STR("[WorldItem] {}: значение свойства {} не записалось\n"), Items::wide(path), v.Spec);
-                }
                 g_sent.insert(instance);
-                Output::send<LogLevel::Verbose>(STR("[WorldItem] создан: {} в ({:.0f}, {:.0f}, {:.0f})\n"), Items::wide(path), body.Transform[4], body.Transform[5], body.Transform[6]);
             }
-            else Output::send<LogLevel::Error>(STR("[WorldItem] нет параметров SpawnItemInstanceActor\n"));
+            else
+            {
+                Output::send<LogLevel::Error>(STR("[WorldItem] нет параметров SpawnItemInstanceActor\n"));
+                instance = nullptr;
+            }
         }
         else Output::send<LogLevel::Warning>(STR("[WorldItem] не создать {} (архетип не загружен)\n"), Items::wide(path));
         g_applying = false;
+        return instance;
+    }
+
+    void on_world_item(const Coop::WorldItemBody& body, const std::string& path, const std::vector<Coop::TrunkValue>& values)
+    {
+        auto* instance = static_cast<UObject*>(spawn_in_world(path, body.Transform, body.CreateContext));
+        if (!instance) return;
+        // Есть ли у экземпляра проявление (актёр) в мире? Без него предмета не видно (жалоба пользователя 2026-11-07)
+        UObject* actor = manifestation_of(instance);
+        g_checks.push_back({FWeakObjectPtr(instance), now_ms()});
+        Output::send<LogLevel::Verbose>(STR("[WorldItem] проявление: {}\n"), actor ? actor->GetFullName() : StringType(STR("НЕТ")));
+        for (const auto& v : values)
+        {
+            auto text = text_of(v);
+            if (text.empty() || !ItemProps::write(instance, ItemProps::Specs[v.Spec], text))
+                Output::send<LogLevel::Warning>(STR("[WorldItem] {}: значение свойства {} не записалось\n"), Items::wide(path), v.Spec);
+        }
+        Output::send<LogLevel::Verbose>(STR("[WorldItem] создан: {} в ({:.0f}, {:.0f}, {:.0f})\n"), Items::wide(path), body.Transform[4], body.Transform[5], body.Transform[6]);
     }
 } // namespace WorldItemSync
