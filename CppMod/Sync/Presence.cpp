@@ -85,8 +85,16 @@ namespace Presence
         UObject* g_own_base = nullptr;
         std::vector<UObject*> g_own_parts;
         std::string g_parts_sent, g_parts_wanted;
-        bool g_parts_dirty = false, g_hand_fx = true;
+        bool g_parts_dirty = false, g_hand_fx = false;
         uint64_t g_stream_until_ms = 0;
+        // Части шлём ~24 раза в секунду (как кино): чаще глазу не нужно
+        constexpr uint64_t PartsIntervalMs = 1000 / 24;
+        uint64_t g_parts_poll_ms = 0;
+        // Использование предмета: у куклы он поднимается по дуге. g_use_t — 0..1, приближается к цели долей остатка за шаг (геометрически)
+        int g_use_sent = -1; // что ушло собеседнику (-1 — ещё не слали)
+        bool g_use_wanted = false;
+        float g_use_t = 0, g_hand_scale = 0.5f;
+        UObject* g_hand_comp = nullptr; // StaticMeshComponent корпуса у куклы
         std::vector<UObject*> g_parts, g_part_comps;
         std::vector<FWeakObjectPtr> g_parts_weak;
 
@@ -328,6 +336,7 @@ namespace Presence
             g_part_comps.clear();
             if (g_hand) destroy_actor(g_hand);
             g_hand = nullptr;
+            g_hand_comp = nullptr;
         }
 
         std::vector<std::string> split(const std::string& s, char sep)
@@ -474,6 +483,67 @@ namespace Presence
             }
         }
 
+        // Положение предмета в кисти куклы: покой (подобрано на глаз через мост на Scrapper, 2026-11-18) + дуга подъёма t∈0..1 и масштаб.
+        // shortcut: одно положение на все предметы; если другие инструменты встанут криво — смещение по классу предмета
+        void pose_hand(float t)
+        {
+            if (!g_hand_comp || !g_component) return;
+            Vec offset{0, 0, 10};
+            if (t > 0.001f)
+            {
+                // Дуга в мировых осях куклы (вверх 40 см, вперёд 20 см — четверть эллипса), в кость переводим обратным поворотом: осей кисти мы не знаем
+                static auto* math = UObjectGlobals::StaticFindObject<UObject*>(nullptr, nullptr, STR("/Script/Engine.Default__KismetMathLibrary"));
+                float a = t * 1.5707963f, yaw = (g_yaw + g_mesh_yaw) * 3.14159265f / 180.f;
+                Vec world{std::cos(yaw) * 20 * (1 - std::cos(a)), std::sin(yaw) * 20 * (1 - std::cos(a)), 40 * std::sin(a)};
+                UFunctionCall sock(g_component, STR("GetSocketTransform"));
+                auto* p_sock = sock ? sock.param<FName>(STR("InSocketName")) : nullptr;
+                auto* p_space = sock ? sock.param<uint8_t>(STR("TransformSpace")) : nullptr;
+                auto* p_tf = sock ? sock.param<Transform>(STR("ReturnValue")) : nullptr;
+                UFunctionCall inv(math, STR("InverseTransformDirection"));
+                auto* p_t = inv ? inv.param<Transform>(STR("T")) : nullptr;
+                auto* p_dir = inv ? inv.param<Vec>(STR("Direction")) : nullptr;
+                auto* p_out = inv ? inv.param<Vec>(STR("ReturnValue")) : nullptr;
+                if (p_sock && p_space && p_tf && p_t && p_dir && p_out)
+                {
+                    *p_sock = FName(STR("hand_r"), FNAME_Add);
+                    *p_space = 0; // RTS_World
+                    sock.call();
+                    *p_t = *p_tf;
+                    *p_dir = world;
+                    inv.call();
+                    offset = {offset.X + p_out->X, offset.Y + p_out->Y, offset.Z + p_out->Z};
+                }
+            }
+            UFunctionCall rel(g_hand_comp, STR("K2_SetRelativeLocationAndRotation"));
+            auto* p_rloc = rel ? rel.param<Vec>(STR("NewLocation")) : nullptr;
+            auto* p_rrot = rel ? rel.param<Rot>(STR("NewRotation")) : nullptr;
+            auto* p_tp = rel ? rel.param<bool>(STR("bTeleport")) : nullptr;
+            if (p_rloc && p_rrot && p_tp)
+            {
+                *p_rloc = offset;
+                *p_rrot = {0, -175, 0};
+                *p_tp = true;
+                rel.call();
+            }
+            // Кончик Scrapper — ось +X меша (замер через мост 2026-11-19): ставим мировой поворот так, чтобы он смотрел вперёд по взгляду куклы,
+            // не зная осей кости. shortcut: ось +X подходит инструментам Scrapper; у других предметов смотреть, куда встанет
+            UFunctionCall world_rot(g_hand_comp, STR("K2_SetWorldRotation"));
+            auto* p_wrot = world_rot ? world_rot.param<Rot>(STR("NewRotation")) : nullptr;
+            auto* p_wtp = world_rot ? world_rot.param<bool>(STR("bTeleport")) : nullptr;
+            if (p_wrot && p_wtp)
+            {
+                *p_wrot = {0, g_yaw + g_mesh_yaw, 0}; // куда смотрит меш куклы, а не её актёр
+                *p_wtp = true;
+                world_rot.call();
+            }
+            UFunctionCall scale(g_hand_comp, STR("SetRelativeScale3D"));
+            if (auto* p = scale ? scale.param<Vec>(STR("NewScale3D")) : nullptr)
+            {
+                *p = {g_hand_scale, g_hand_scale, g_hand_scale};
+                scale.call();
+            }
+        }
+
         // Кукла — манекен ALS (скелет UE4: правая кисть — кость hand_r). Прикрепляем меш предмета к ней: он ходит вместе с рукой.
         // Кости нет (другой меш) — false, предмет ставим смещением (place_hand)
         bool attach_to_hand(UObject* item_component)
@@ -501,19 +571,8 @@ namespace Presence
             *p_scale = 1;        // KeepWorld: масштаб предмета 1, не масштаб кости
             attach.call();
             if (!*p_ret) return false;
-            // Положение в кисти подобрано на глаз через мост на Scrapper (2026-11-18): иначе инструмент смотрит за спину и висит низко.
-            // shortcut: одно положение на все предметы; если другие инструменты встанут криво — смещение по классу предмета
-            UFunctionCall rel(item_component, STR("K2_SetRelativeLocationAndRotation"));
-            auto* p_rloc = rel ? rel.param<Vec>(STR("NewLocation")) : nullptr;
-            auto* p_rrot = rel ? rel.param<Rot>(STR("NewRotation")) : nullptr;
-            auto* p_tp = rel ? rel.param<bool>(STR("bTeleport")) : nullptr;
-            if (p_rloc && p_rrot && p_tp)
-            {
-                *p_rloc = {0, 0, 10};
-                *p_rrot = {0, -175, 0};
-                *p_tp = true;
-                rel.call();
-            }
+            g_hand_comp = item_component;
+            pose_hand(0);
             return true;
         }
 
@@ -608,6 +667,11 @@ namespace Presence
             g_parts_dirty = true;
             return;
         }
+        if (tag == "use")
+        {
+            g_use_wanted = mesh_path == "1";
+            return;
+        }
         if (tag != "hand" || mesh_path == g_hand_wanted) return;
         g_hand_wanted = mesh_path;
         g_parts_wanted.clear(); // части нового предмета придут следом
@@ -620,7 +684,7 @@ namespace Presence
     bool seated() { return g_seated; }
     const Coop::PoseBody* mate() { return g_have_target && Net::connected() && now_ms() - g_target_ms <= StaleMs ? &g_target : nullptr; }
 
-    void tick(float delta_seconds, bool hand_fx)
+    void tick(float delta_seconds, bool hand_fx, float hand_scale)
     {
         if (g_map_loaded.exchange(false))
         {
@@ -631,6 +695,13 @@ namespace Presence
             g_own_parts.clear();
             g_hand_dirty = true;
             g_hand_sent = "\x01"; // собеседник мог потерять нашу руку вместе со своим миром
+            g_use_sent = -1;
+            g_hand_comp = nullptr;
+        }
+        if (hand_scale != g_hand_scale)
+        {
+            g_hand_scale = hand_scale;
+            pose_hand(g_use_t);
         }
         if (hand_fx != g_hand_fx)
         {
@@ -642,6 +713,7 @@ namespace Presence
         if (!Net::connected())
         {
             g_hand_sent = "\x01"; // после переподключения шлём руку заново
+            g_use_sent = -1;
             return;
         }
         UObject* character = own_character();
@@ -672,9 +744,15 @@ namespace Presence
                     else g_own_item = nullptr; // не ушло — повторим на следующем опросе
                 }
             }
-            // Части шлём, пока предмет работает (и чуть после), плюс один снимок на новый предмет; в покое — тишина
-            auto* desire = item && g_own_item_weak.Get() ? property<bool>(item, STR("Desire Tool Primary Use")) : nullptr;
-            if (desire && *desire) g_stream_until_ms = now + StreamAfterUseMs;
+        }
+        // Части и флаг «использует» — 24 Гц, пока предмет работает (и чуть после), плюс один снимок на новый предмет; в покое — тишина
+        if (now - g_parts_poll_ms >= PartsIntervalMs)
+        {
+            g_parts_poll_ms = now;
+            auto* desire = g_own_item && g_own_item_weak.Get() ? property<bool>(g_own_item, STR("Desire Tool Primary Use")) : nullptr;
+            bool use = desire && *desire;
+            if (use) g_stream_until_ms = now + StreamAfterUseMs;
+            if (int(use) != g_use_sent && Net::send_part("use", use ? "1" : "0", Coop::HandItem)) g_use_sent = use;
             if (!g_own_parts.empty() && g_own_item_weak.Get() && (now < g_stream_until_ms || g_parts_sent.empty()))
             {
                 std::string text = own_parts_text();
@@ -745,6 +823,14 @@ namespace Presence
                 apply_parts();
             }
             if (!g_hand_attached) place_hand(g_pos, g_yaw);
+            else
+            {
+                // Использование: предмет идёт вверх по дуге, доля остатка за шаг постоянна (геометрический ряд); в машине — без подъёма
+                float goal = g_use_wanted && !g_hand_hidden ? 1.f : 0.f;
+                g_use_t += (goal - g_use_t) * (1 - std::exp(-delta_seconds * 9));
+                if (g_use_t < 0.002f) g_use_t = 0;
+                pose_hand(g_use_t); // каждый кадр: кость идёт за анимацией, поворот держим по взгляду куклы
+            }
         }
     }
 } // namespace Presence

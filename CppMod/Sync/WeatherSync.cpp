@@ -255,10 +255,131 @@ namespace WeatherSync
                 logged_ms = now, Output::send<LogLevel::Verbose>(STR("[Gev] зона события ({:.0f}, {:.0f}, {:.0f}) → как у Host ({:.0f}, {:.0f}, {:.0f})\n"), at.X, at.Y, at.Z,
                                                                 g_gev_host_at.X, g_gev_host_at.Y, g_gev_host_at.Z);
         }
+
+        // ---- время суток и север (чужой мод pacific-together, docs/recon/reference/pacific-together.md; у нас не проверено) ----
+        // Время суток — тег WB.WorldState.TimeOfDay глобальной доски (0..1), у каждого ПК идёт по своим часам. Север — случайный
+        // поворот карты на 0/90/180/270° (RandomizeNorth), у Client без общего сейва свой. Host шлёт оба раз в TodSendMs, Client
+        // правит, только если разошлись больше допуска — чтобы не дёргать каждую секунду
+        constexpr uint64_t TodSendMs = 2000;
+        constexpr float TodTolerance = 0.003f, NorthTolerance = 0.5f;
+        struct Rot
+        {
+            float Pitch, Yaw, Roll;
+        };
+        float g_tod_host = NAN, g_north_host = NAN, g_tod_sent = NAN, g_north_sent = NAN;
+        bool g_have_tod = false;
+        uint64_t g_tod_sent_ms = 0, g_tod_log_ms = 0;
+        int g_tod_sets = 0;
+
+        UObject* map_bounds() { static Cached::First f{STR("BP_GobblerMapBounds_C")}; return f.get(); }
+
+        bool read_tod(UObject* tod, float& time, float& yaw)
+        {
+            UFunctionCall get(tod, STR("Get Current Time Of Day"));
+            auto* ret = get ? get.param<float>(STR("Returned Time Of Day")) : nullptr;
+            auto* north = property<Rot>(tod, STR("Current North As Rotator"));
+            if (!ret || !north) return false;
+            get.call();
+            time = *ret;
+            yaw = north->Yaw;
+            return true;
+        }
+
+        float angle_gap(float a, float b)
+        {
+            float d = std::fmod(std::fabs(a - b), 360.0f);
+            return std::min(d, 360.0f - d);
+        }
+
+        void set_north(UObject* tod, float yaw)
+        {
+            const float rad = yaw * 3.14159265f / 180.0f;
+            UFunctionCall set(tod, STR("SetTrueNorth"));
+            auto* p_vec = set ? set.param<Vec>(STR("New North Vector")) : nullptr;
+            auto* p_rot = set ? set.param<Rot>(STR("New North Rotator")) : nullptr;
+            if (!p_vec || !p_rot) return;
+            *p_vec = {std::cos(rad), std::sin(rad), 0};
+            *p_rot = {0, yaw, 0};
+            set.call();
+            // как RandomizeNorth(true): солнце поворачивается вместе с севером
+            auto** sim = property<UObject*>(tod, STR("ToDSimulationActor"));
+            if (sim && *sim)
+                if (UFunctionCall turn(*sim, STR("K2_SetActorRotation")); turn)
+                    if (auto* p_new = turn.param<Rot>(STR("NewRotation")))
+                        if (auto* p_tp = turn.param<bool>(STR("bTeleportPhysics"))) *p_new = {0, yaw, 0}, *p_tp = false, turn.call();
+            // картинка карты ARC рисуется заново, иначе она остаётся повёрнутой по-старому
+            if (UObject* bounds = map_bounds())
+                if (UFunctionCall cap(bounds, STR("Capture Configure")); cap)
+                    if (auto* p_re = cap.param<bool>(STR("Recapture"))) *p_re = true, cap.call();
+        }
+
+        // Client: симуляция времени суток теряет связь с менеджером (у чужого мода: Host в дожде, гость сухой). Связь — актёр с тегом
+        // ToDSim (SetupToDSimulationActor); пресет симуляции должен совпадать с целевым пресетом менеджера (WeatherChangeEvent).
+        // Лечим только расхождение; в лог — раз в RetryMs
+        uint64_t g_relink_ms = 0;
+        void relink_sim(UObject* tod, uint64_t now)
+        {
+            auto** sim = property<UObject*>(tod, STR("ToDSimulationActor"));
+            if (!sim || now - g_relink_ms < RetryMs) return;
+            if (!*sim || !Cached::settled(*sim))
+            {
+                g_relink_ms = now;
+                if (UFunctionCall setup(tod, STR("SetupToDSimulationActor")); setup) setup.call();
+                Output::send<LogLevel::Verbose>(STR("[Weather] у менеджера нет симуляции времени суток — SetupToDSimulationActor\n"));
+                return;
+            }
+            auto** want = property<UObject*>(tod, STR("Target TOD Preset"));
+            auto** cur = property<UObject*>(*sim, STR("CurrentPresetObject"));
+            if (!want || !*want || !cur || !*cur || (*cur)->GetClassPrivate() == static_cast<UClass*>(*want)) return;
+            g_relink_ms = now;
+            UFunctionCall change(*sim, STR("WeatherChangeEvent"));
+            if (auto* p = change ? change.param<UObject*>(STR("Weather Weighting")) : nullptr) *p = *want, change.call();
+            Output::send<LogLevel::Verbose>(STR("[Weather] пресет симуляции {} ≠ целевому {} — WeatherChangeEvent\n"), short_name(Items::narrow((*cur)->GetClassPrivate()->GetPathName())),
+                                            short_name(Items::narrow((*want)->GetPathName())));
+        }
+
+        void tod_host(UObject* tod, uint64_t now)
+        {
+            if (now - g_tod_sent_ms < TodSendMs) return;
+            float time, yaw;
+            if (!read_tod(tod, time, yaw)) return;
+            char text[64];
+            std::snprintf(text, sizeof text, "%.4f %.2f", time, yaw);
+            Net::send_part("tod", text, Coop::WeatherEvent);
+            g_tod_sent_ms = now;
+            if (std::isnan(g_north_sent) || angle_gap(yaw, g_north_sent) > NorthTolerance)
+                Output::send<LogLevel::Verbose>(STR("[Weather] время суток {:.3f}, север {:.1f}° → отправляю\n"), time, yaw);
+            g_tod_sent = time, g_north_sent = yaw;
+        }
+
+        void tod_client(UObject* tod, uint64_t now)
+        {
+            float time, yaw;
+            if (!read_tod(tod, time, yaw)) return;
+            float gap = std::fabs(time - g_tod_host);
+            gap = std::min(gap, 1.0f - gap);
+            if (gap > TodTolerance)
+                if (UFunctionCall set(tod, STR("Set Current Time Of Day")); set)
+                    if (auto* p = set.param<float>(STR("New Time Of Day"))) *p = g_tod_host, set.call(), ++g_tod_sets;
+            if (angle_gap(yaw, g_north_host) > NorthTolerance)
+            {
+                set_north(tod, g_north_host);
+                Output::send<LogLevel::Verbose>(STR("[Weather] север {:.1f}° → как у Host {:.1f}°\n"), yaw, g_north_host);
+            }
+            if (now - g_tod_log_ms >= ResendMs)
+            {
+                g_tod_log_ms = now;
+                Output::send<LogLevel::Verbose>(STR("[Weather] время суток: у меня {:.3f}, у Host {:.3f}; поправлено {} раз за 10 с\n"), time, g_tod_host, g_tod_sets);
+                g_tod_sets = 0;
+            }
+        }
     } // namespace
 
     void on_map_loaded()
     {
+        g_have_tod = false;
+        g_tod_sent_ms = 0;
+        g_tod_sent = g_north_sent = NAN;
         g_loaded_ms = now_ms();
         g_sent = "\x01";
         g_have_host = false; // погода прошлой карты больше не действует — ждём новую от Host-а
@@ -282,6 +403,13 @@ namespace WeatherSync
             g_gev_host = host;
             g_gev_host_at = at; // "nan" sscanf читает как NaN — зоны нет
             g_have_gev = true;
+            return;
+        }
+        if (tag == "tod")
+        {
+            float time, yaw;
+            if (std::sscanf(path.c_str(), "%f %f", &time, &yaw) != 2) return;
+            g_tod_host = time, g_north_host = yaw, g_have_tod = true;
             return;
         }
         if (tag == "lvl")
@@ -316,6 +444,8 @@ namespace WeatherSync
         g_tod = manager();
         Cached::track(g_tod, g_tod_weak);
         if (g_tod && !is_host) install_levels_hook(g_tod);
+        if (g_tod && !is_host) relink_sim(g_tod, now);
+        if (g_tod) is_host ? tod_host(g_tod, now) : (g_have_tod ? tod_client(g_tod, now) : void());
         if (g_tod && is_host)
         {
             float v[LevelCount];

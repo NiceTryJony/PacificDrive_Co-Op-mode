@@ -45,7 +45,9 @@ namespace Net
         // Client, сидя в машине, шлёт Host-у свой газ и руль (DriveInput) — Host ведёт машину по ним. По умолчанию выключено (coop.ini: client_drive=1)
         bool client_drive = false;
         // Предмет в руке собеседника: показывать его работу (насадки, пламя, плазма, вращение), а не только корпус (coop.ini: hand_fx=0 — только модель)
-        bool hand_fx = true;
+        bool hand_fx = false; // по умолчанию выкл: огоньки и насадки по частям вставали криво (2026-11-19), показываем модель
+        // Размер предмета в руке куклы (1 = как в игре; coop.ini: hand_scale)
+        float hand_scale = 0.5f;
         // Разведка 4б (DriveProbe): подмена оси газа/руля у машины Host; оба 0 — выключено (coop.ini: drive_probe_throttle, drive_probe_steer)
         float drive_probe_throttle = 0, drive_probe_steer = 0;
     };
@@ -98,6 +100,8 @@ namespace Net
     bool connected();
     int zone_progress();    // Client: сколько процентов сейва зоны уже принято; -1 — приёма сейчас нет
     int rtt_ms();           // -1 — нет связи
+    bool version_mismatch(); // Client: Host отклонил — версии мода не совпадают
+    int connect_attempts();  // Client: сколько попыток подключения с последнего успешного соединения
     double loss_percent();  // для окна статуса
     void send_zone_save(const std::vector<uint8_t>& file, const Events& events);
     void send_passenger_save(const std::vector<uint8_t>& file, const Events& events); // тем же способом, что зона

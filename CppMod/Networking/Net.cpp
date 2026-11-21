@@ -37,6 +37,7 @@ namespace Net
         std::thread g_thread;
         std::atomic<bool> g_running{false}, g_connected{false}, g_version_mismatch{false};
         std::atomic<int> g_rtt{-1};
+        std::atomic<int> g_attempts{0}; // попытки подключения Client с последнего успеха (карточка входа в HUD)
         std::atomic<double> g_loss{0};
         std::atomic<uint32_t> g_sequence{0};
         uint32_t g_tx_id = 0; // id последней отправки файла (игровой поток)
@@ -331,6 +332,7 @@ namespace Net
             enet_address_set_host(&address, g_config.host_ip.c_str());
             address.port = g_config.port;
             g_peer = enet_host_connect(g_host, &address, Coop::NumChannels, Coop::ProtocolVersion);
+            ++g_attempts;
             log_async(std::format(L"[Net] подключение к {}:{}...", std::wstring(g_config.host_ip.begin(), g_config.host_ip.end()), g_config.port));
         }
 
@@ -389,6 +391,7 @@ namespace Net
                 clear_out(); // до connected: модули досылают полное состояние в on_connected, старое устарело
                 enet_peer_timeout(g_peer, 0, TimeoutMinMs, TimeoutMaxMs);
                 g_connected = true;
+                g_attempts = 0;
                 push_in({InKind::Connected, {}, L"[Net] соединение установлено"});
                 break;
             case ENET_EVENT_TYPE_DISCONNECT:
@@ -519,6 +522,7 @@ namespace Net
             else if (key == "heap_test") config.heap_test = value != "0";
             else if (key == "client_drive") config.client_drive = value != "0";
             else if (key == "hand_fx") config.hand_fx = value != "0";
+            else if (key == "hand_scale") config.hand_scale = std::clamp(static_cast<float>(std::atof(value.c_str())), 0.1f, 2.0f);
             else if (key == "drive_probe_throttle") config.drive_probe_throttle = static_cast<float>(std::atof(value.c_str()));
             else if (key == "drive_probe_steer") config.drive_probe_steer = static_cast<float>(std::atof(value.c_str()));
             else if (key == "sim_loss") config.sim_loss_percent = static_cast<float>(std::atof(value.c_str()));
@@ -644,6 +648,8 @@ namespace Net
     }
 
     bool connected() { return g_connected; }
+    bool version_mismatch() { return g_version_mismatch; }
+    int connect_attempts() { return g_attempts; }
 
     int zone_progress()
     {

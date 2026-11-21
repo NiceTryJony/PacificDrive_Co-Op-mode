@@ -46,6 +46,25 @@ namespace RC::Unreal::Cached
         return true;
     }
 
+    // Объект можно читать: FindAllOf отдаёт и уничтоженные (PendingKill живёт до GC), и недогруженные. Читать свойства такого объекта
+    // нельзя — Host падал на ресурсе из подгружаемого подуровня. strict (только Host) — ещё и не AsyncLoading: у Client строгая
+    // проверка отсекала нужные предметы (по наблюдению чужого мода pacific-together, docs/recon/reference/pacific-together.md)
+    inline bool settled(UObject* o, bool strict = false)
+    {
+        if (!o) return false;
+        auto bad = EInternalObjectFlags::PendingKill | EInternalObjectFlags::Unreachable;
+        if (strict) bad = bad | EInternalObjectFlags::AsyncLoading;
+        return !o->HasAnyInternalFlags(bad);
+    }
+
+    // FindAllOf без уничтоженных и недогруженных объектов (добавляет к out, как FindAllOf)
+    inline void find_settled(const TCHAR* class_name, std::vector<UObject*>& out, bool strict = false)
+    {
+        size_t from = out.size();
+        UObjectGlobals::FindAllOf(class_name, out);
+        out.erase(std::remove_if(out.begin() + static_cast<std::ptrdiff_t>(from), out.end(), [strict](UObject* o) { return !settled(o, strict); }), out.end());
+    }
+
     inline uint64_t now_ms()
     {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());

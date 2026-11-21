@@ -42,7 +42,7 @@ namespace StatusFile
         if (!out) out.close(); // открыть заново в следующий раз
     }
 
-    void tick(const std::filesystem::path& file, const std::string& version, Net::Role role, const std::string& phase)
+    void tick(const std::filesystem::path& file, const std::string& version, Net::Role role, const std::string& phase, const std::string& stage_lines)
     {
         using namespace std::chrono;
         int64_t now_ms = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -56,6 +56,7 @@ namespace StatusFile
         std::string text = std::format("version={}\nrole={}\nconnected={}\n", version, role == Net::Role::Host ? "host" : role == Net::Role::Client ? "client" : "off",
                                        connected ? 1 : 0);
         text += "phase=" + phase + "\n";
+        text += stage_lines; // stage/attempt/in_world для карточки входа Client в HUD (hud.lua)
         // Время — абсолютное (unix): файл не меняется каждую секунду, HUD считает «сколько прошло» сам
         if (g_session_at) text += std::format("session_at={}\n", g_session_at);
         if (int64_t saved = g_world_saved_at) text += std::format("world_saved_at={}\n", saved);

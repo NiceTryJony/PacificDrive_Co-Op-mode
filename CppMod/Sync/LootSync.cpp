@@ -208,7 +208,7 @@ namespace LootSync
             int ground = 0, parts = 0, in_crates = 0, resources = 0;
             std::vector<UObject*> actors;
             // 1. Предметы на земле (у них bWorldOwned = 0 и слота нет — тест 2026-10-27)
-            UObjectGlobals::FindAllOf(STR("ItemWorldManifestation"), actors);
+            Cached::find_settled(STR("ItemWorldManifestation"), actors, is_host);
             for (UObject* actor : actors)
             {
                 auto** instance = property<UObject*>(actor, STR("Instance"));
@@ -216,7 +216,7 @@ namespace LootSync
             }
             // 2. Детали машин-доноров (двери, колёса, капоты…): разбор = экземпляр в инвентарь или уничтожен
             actors.clear();
-            UObjectGlobals::FindAllOf(STR("LootableTemplatePart"), actors);
+            Cached::find_settled(STR("LootableTemplatePart"), actors, is_host);
             for (UObject* actor : actors)
             {
                 auto** instance = property<UObject*>(actor, STR("ItemInstance"));
@@ -224,12 +224,12 @@ namespace LootSync
             }
             // 2а. Ресурсы под распил (тест 2026-11-10 07:33: Host распилил свинцовую плиту — у Client осталась)
             actors.clear();
-            UObjectGlobals::FindAllOf(STR("BP_Spawn_ResourceBase_C"), actors);
+            Cached::find_settled(STR("BP_Spawn_ResourceBase_C"), actors, is_host);
             for (UObject* actor : actors)
                 if (!g_seen.contains(actor)) resources += consider_resource(actor);
             // 3. Содержимое ящиков/шкафчиков/рюкзаков: экземпляры в слотах InventoryContainer, якорь — сам ящик
             actors.clear();
-            UObjectGlobals::FindAllOf(STR("BP_Lootable_Base_C"), actors);
+            Cached::find_settled(STR("BP_Lootable_Base_C"), actors, is_host);
             for (UObject* crate : actors)
             {
                 // Флаг «предметы при открытии уже разыграны» сейв не сохраняет (тест 2026-10-27): у Client ставим сами,
@@ -257,12 +257,12 @@ namespace LootSync
             //    Кузова грузовиков (BP_TemplatePart_TruckBedContainer_C, тест 2026-11-17 21:22) устроены так же
             int in_trunks = 0;
             actors.clear();
-            UObjectGlobals::FindAllOf(STR("BP_TemplatePart_TrunkContents_C"), actors);
-            UObjectGlobals::FindAllOf(STR("BP_TemplatePart_TruckBedContainer_C"), actors);
+            Cached::find_settled(STR("BP_TemplatePart_TrunkContents_C"), actors, is_host);
+            Cached::find_settled(STR("BP_TemplatePart_TruckBedContainer_C"), actors, is_host);
             if (!actors.empty())
             {
                 std::vector<UObject*> containers;
-                UObjectGlobals::FindAllOf(STR("ItemContainer"), containers);
+                Cached::find_settled(STR("ItemContainer"), containers, is_host);
                 std::unordered_multimap<UObject*, UObject*> by_outer; // Outer → контейнер: вместо перебора «багажники × контейнеры»
                 for (UObject* container : containers) by_outer.emplace(container->GetOuterPrivate(), container);
                 for (UObject* trunk : actors)
@@ -370,7 +370,7 @@ namespace LootSync
     void preroll_containers()
     {
         std::vector<UObject*> crates;
-        UObjectGlobals::FindAllOf(STR("BP_Lootable_Base_C"), crates);
+        Cached::find_settled(STR("BP_Lootable_Base_C"), crates);
         int rolled = 0, already = 0;
         for (UObject* crate : crates)
         {

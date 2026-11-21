@@ -9,6 +9,8 @@
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/Hooks/Hooks.hpp>
 
+#include "LaunchGate.h"
+#include "Sync/JoinStage.h"
 #include "Game/Cached.h"
 #include "Game/ItemProps.h"
 #include "Game/ObjectDump.h"
@@ -443,6 +445,7 @@ namespace LiveConfig
         g_net_config.camera_follow = c.camera_follow;
         g_net_config.exit_side_cm = c.exit_side_cm;
         g_net_config.client_parts = c.client_parts;
+        g_net_config.hand_scale = c.hand_scale;
         g_net_config.hand_fx = c.hand_fx; // Presence::tick сам пересоберёт предмет у куклы
         PassengerSync::set_restrict_interactions(c.restrict_interactions);
         PassengerSync::set_camera_follow(c.camera_follow);
@@ -511,6 +514,29 @@ namespace Overlay
     {
         phase_cached();
         return g_phase_ascii;
+    }
+
+    // Этап входа Client — для карточки в HUD (hud.lua, status.txt: stage/attempt/in_world). Порядок как в phase(): сначала то, что видно игроку
+    std::string stage_lines()
+    {
+        static bool was_connected = false;
+        phase_cached(); // g_world_synced обновляется в phase()
+        bool connected = Net::connected();
+        if (connected) was_connected = true;
+        std::string out = std::format("in_world={}\n", Cached::character() ? 1 : 0);
+        if (g_net_config.role != Net::Role::Client) return out;
+        uint64_t since = ZoneLoad::g_loading_since_ms;
+        JoinStage::In in;
+        in.version_mismatch = Net::version_mismatch();
+        in.ready = g_ready_at_ms != 0;
+        in.loading = since && ZoneLoad::now_ms() - since < LoadingTimeoutMs;
+        in.connected = connected;
+        in.was_connected = was_connected;
+        in.receiving = Net::zone_progress() >= 0;
+        in.restoring = PassengerSaveSync::restore_pending();
+        in.world_synced = g_world_synced;
+        out += std::format("stage={}\nattempt={}\n", JoinStage::of(in), Net::connect_attempts());
+        return out;
     }
 
     std::wstring text()
@@ -652,7 +678,7 @@ public:
                         else run();
                     };
                     step(0, L"Net", [&] { Net::tick(g_net_events); });
-                    step(1, L"Presence", [&] { Presence::tick(delta_seconds, g_net_config.hand_fx); });
+                    step(1, L"Presence", [&] { Presence::tick(delta_seconds, g_net_config.hand_fx, g_net_config.hand_scale); });
                     step(2, L"CarSync", [&] { CarSync::tick(delta_seconds, host); });
                     step(3, L"PassengerSync", [&] { PassengerSync::tick(host); });
                     step(4, L"LootSync", [&] { LootSync::tick(host); });
@@ -663,7 +689,7 @@ public:
                     step(9, L"TrunkSync", [&] { TrunkSync::tick(host); });
                     step(10, L"Diag", [&] { Diag::tick(host); });
                     step(11, L"PassengerSaveSync", [&] { PassengerSaveSync::tick(host, ZoneLoad::current_slot_file); });
-                    step(12, L"StatusFile", [&] { StatusFile::tick(ZoneSave::CoopDir / "status.txt", g_version, g_net_config.role, Overlay::phase_ascii()); });
+                    step(12, L"StatusFile", [&] { StatusFile::tick(ZoneSave::CoopDir / "status.txt", g_version, g_net_config.role, Overlay::phase_ascii(), Overlay::stage_lines()); });
                     step(13, L"QuirkSync", [&] { QuirkSync::tick(host); });
                     step(14, L"AnchorSync", [&] { AnchorSync::tick(host); });
                     step(15, L"ZoneTrace", [&] { ZoneTrace::tick(); });
@@ -738,6 +764,12 @@ extern "C"
 {
     __declspec(dllexport) RC::CppUserModBase* start_mod()
     {
+        // без пропуска лаунчера (запуск мимо него или «мод выключен» в лаунчере) — пустой мод: никаких хуков, сети и оверлея
+        if (!LaunchGate::valid_now())
+        {
+            RC::Output::send<RC::LogLevel::Verbose>(STR("[PacificDriveCoop] no launcher pass (launch.token): the mod stays off\n"));
+            return new RC::CppUserModBase();
+        }
         return new PacificDriveCoop();
     }
 

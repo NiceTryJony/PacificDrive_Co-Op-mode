@@ -5,6 +5,7 @@
 #include <Unreal/Hooks/Hooks.hpp>
 #include <Unreal/UClass.hpp>
 
+#include "Game/Cached.h"
 #include "Game/Items.h"
 #include "Game/UFunctionCall.h"
 #include "Networking/Net.h"
@@ -289,7 +290,7 @@ namespace ZoneTrace
         if (!g_census_due || now_ms() < g_quiet_until) return;
         g_census_due = false;
         std::vector<UObject*> actors;
-        UObjectGlobals::FindAllOf(STR("Actor"), actors);
+        Cached::find_settled(STR("Actor"), actors);
         std::map<StringType, int> counts;
         for (auto* a : actors)
         {
